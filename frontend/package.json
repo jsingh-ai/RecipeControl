@@ -10,7 +10,8 @@
     "typecheck": "tsc -b --pretty false",
     "test": "vitest run",
     "test:watch": "vitest",
-    "e2e": "playwright test"
+    "e2e": "playwright test",
+    "e2e:real": "python3 ../scripts/run_real_e2e.py"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.0",

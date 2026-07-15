@@ -34,18 +34,30 @@ The Compose stack uses MySQL 8.4 for writable RecipeControl data and the fixture
 docker compose up --build
 ```
 
-Compose refuses to start without those uncommitted passwords. To connect a real source, also configure all source mapping variables described below and in `docs/source-schema.md`.
+Compose refuses to start without those uncommitted passwords. To connect a real source, configure the exact collector URL described in `docs/source-schema.md`.
 
 ## Live source configuration
 
-No `db.py` or source schema existed in this repository, so the default is deliberately `SOURCE_ADAPTER=fixture`. To map the real read-only collector:
+The default remains `SOURCE_ADAPTER=fixture`. To use the authoritative `opcua_collector` schema:
 
 1. Create a read-only MySQL account restricted to `SELECT`.
 2. Set `SOURCE_ADAPTER=mysql` and `SOURCE_DATABASE_URL` only in `.env` or the process environment.
-3. Fill every `SOURCE_*_TABLE` and `SOURCE_*_COLUMN` setting using discovered real identifiers. Optional units may be omitted.
-4. Run `make seed`, then inspect `/api/health` and tag search.
+3. Keep `APP_DATABASE_URL` on a separate writable database/account. Startup rejects reuse of the source username on the same host and port.
+4. Run `make seed`, then inspect `/api/health` and paginated tag search.
 
-The MySQL adapter validates identifiers and binds all values. It issues only `SELECT` statements. Alembic uses only `APP_DATABASE_URL`. Never point `APP_DATABASE_URL` at the collector database.
+The adapter contains only the fixed `machines`, `tags`, and `tag_samples` reads documented below. Query values are bound, the session time zone is `+00:00`, and Alembic uses only `APP_DATABASE_URL`. Never point `APP_DATABASE_URL` at the collector database.
+
+Read-only source smoke commands:
+
+```bash
+.venv/bin/recipecontrol-source-smoke health
+.venv/bin/recipecontrol-source-smoke machines
+.venv/bin/recipecontrol-source-smoke tags --machine 1 --query temperature --limit 20
+.venv/bin/recipecontrol-source-smoke range --machine 1
+.venv/bin/recipecontrol-source-smoke dry-run --machine 1 --tag 10 --kind numeric --start 2026-06-23T14:15:00Z --inclusive-end 2026-06-23T14:20:00Z
+```
+
+The dry run reports `2026-06-23T14:21:00+00:00` as the exclusive query end and never opens the application database.
 
 ## Commands
 
@@ -62,6 +74,7 @@ make typecheck      # mypy and TypeScript
 make test-backend   # Pytest unit/integration suite
 make test-frontend  # Vitest/Testing Library suite
 make e2e            # Playwright critical workflow
+make e2e-real       # unmocked migrated API + worker + fixture + frontend workflow
 make build          # production frontend build
 make checks         # every check above plus Playwright
 ```
@@ -103,6 +116,7 @@ Downgrade the application schema:
 
 - `no such table`: run `make migrate` with the same `APP_DATABASE_URL` used by the API and workers.
 - Analysis remains queued: start `make worker`; inspect the analysis job status and server logs.
+- A worker that stops heartbeating is reclaimed after `STALE_JOB_TIMEOUT_SECONDS`; jobs fail with a sanitized message after `HISTORICAL_JOB_MAX_ATTEMPTS`.
 - Live heartbeat is stale: start `make live-worker` and confirm all processes share `APP_DATABASE_URL`.
 - Source health fails: verify the read-only URL, network path, and exact mapping variables. Errors returned to the browser are intentionally redacted.
 - MySQL datetime appears naive: the adapter intentionally attaches UTC because `sampled_at_utc` is authoritative UTC.

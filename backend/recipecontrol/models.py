@@ -92,6 +92,7 @@ class RuleConditionModel(TimestampMixin, Base):
     position: Mapped[int] = mapped_column(Integer)
     source_tag_key: Mapped[str] = mapped_column(String(255))
     source_display_name: Mapped[str] = mapped_column(String(255))
+    source_raw_data_type: Mapped[str | None] = mapped_column(String(120))
     source_data_type: Mapped[str] = mapped_column(String(30))
     operator: Mapped[str] = mapped_column(String(30))
     minimum: Mapped[str | None] = mapped_column(String(100))
@@ -235,6 +236,20 @@ class ConditionIntervalModel(Base):
     trigger_utc: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     confirmation_utc: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     summary_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+
+
+class AnalysisMinuteModel(Base):
+    __tablename__ = "rc_analysis_minute"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    analysis_id: Mapped[int] = mapped_column(ForeignKey("rc_analysis.id"), index=True)
+    segment_id: Mapped[int] = mapped_column(ForeignKey("rc_segment.id"), index=True)
+    minute_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    system_state: Mapped[str] = mapped_column(String(30))
+    snapshot: Mapped[dict[str, Any]] = mapped_column(JSON)
+    __table_args__ = (
+        UniqueConstraint("analysis_id", "minute_utc", name="uq_analysis_minute"),
+        Index("ix_analysis_minute_lookup", "analysis_id", "minute_utc"),
+    )
 
 
 class BoundaryEventModel(Base):

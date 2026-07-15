@@ -10,6 +10,7 @@ from recipecontrol.domain.models import (
     DataType,
     LaneState,
     LogicOperator,
+    MinuteEvaluation,
     RuleDefinition,
     Segment,
     SegmentationResult,
@@ -222,21 +223,47 @@ def segment_timeline(
         incumbent = chosen.get(key)
         candidate_rank = (stamp, _tie_rank(sample.tie_breaker))
         if incumbent is None:
-            chosen[key] = Sample(sample.tag_key, stamp, sample.value, sample.tie_breaker)
+            chosen[key] = Sample(
+                sample.tag_key,
+                stamp,
+                sample.value,
+                sample.tie_breaker,
+                sample.quality,
+                sample.status_code,
+                sample.error_text,
+            )
         else:
             old_stamp = incumbent.sampled_at_utc
             if old_stamp.tzinfo is None:
                 old_stamp = old_stamp.replace(tzinfo=UTC)
             if candidate_rank > (old_stamp.astimezone(UTC), _tie_rank(incumbent.tie_breaker)):
-                chosen[key] = Sample(sample.tag_key, stamp, sample.value, sample.tie_breaker)
+                chosen[key] = Sample(
+                    sample.tag_key,
+                    stamp,
+                    sample.value,
+                    sample.tie_breaker,
+                    sample.quality,
+                    sample.status_code,
+                    sample.error_text,
+                )
 
     values: dict[str, list[Decimal | str | bool | None]] = {
         tag_key: [None for _ in grid] for tag_key in tag_types
     }
     present: dict[str, list[bool]] = {tag_key: [False for _ in grid] for tag_key in tag_types}
+    source_metadata: dict[str, list[dict[str, object] | None]] = {
+        tag_key: [None for _ in grid] for tag_key in tag_types
+    }
     for (tag_key, minute), sample in chosen.items():
         index = grid_index[minute]
         present[tag_key][index] = True
+        source_metadata[tag_key][index] = {
+            "sample_id": sample.tie_breaker,
+            "sampled_at_utc": sample.sampled_at_utc.isoformat(),
+            "quality": sample.quality,
+            "status_code": sample.status_code,
+            "error_text": sample.error_text,
+        }
         if sample.value is not None:
             values[tag_key][index] = _normalize(sample.value, tag_types[tag_key])
 
@@ -336,6 +363,66 @@ def segment_timeline(
         group_results_by_index.append(group_results)
         root_results.append(root)
 
+    minute_evaluations: list[MinuteEvaluation] = []
+    for visible_index, minute in enumerate(grid[visible_offset:]):
+        absolute_index = visible_offset + visible_index
+        condition_context: dict[str, object] = {}
+        for condition in conditions:
+            delta_reference = refs_by_condition[condition.id][absolute_index]
+            trigger = triggers_by_condition[condition.id][absolute_index]
+            confirmation = confirms_by_condition[condition.id][absolute_index]
+            required = max(1, condition.duration_minutes)
+            progress = min(required, int((minute - trigger) / MINUTE) + 1) if trigger else 0
+            condition_context[str(condition.id)] = {
+                "condition_id": condition.id,
+                "tag_id": condition.tag_key,
+                "display_name": condition.display_name,
+                "value": _json_value(values[condition.tag_key][absolute_index]),
+                "operator": condition.operator.value,
+                "minimum": _json_value(condition.minimum),
+                "maximum": _json_value(condition.maximum),
+                "comparison_value": _json_value(condition.comparison_value),
+                "delta_amount": _json_value(condition.delta_amount),
+                "delta_window_minutes": condition.delta_window_minutes,
+                "duration_minutes": condition.duration_minutes,
+                "raw_matched": raw_by_condition[condition.id][absolute_index],
+                "pending_progress": {"current": progress, "required": required},
+                "qualified_active": lane_by_condition[condition.id][absolute_index]
+                is LaneState.ACTIVE,
+                "lane_state": lane_by_condition[condition.id][absolute_index].value,
+                "trigger_utc": trigger.isoformat() if trigger else None,
+                "confirmation_utc": confirmation.isoformat() if confirmation else None,
+                "delta_reference": (
+                    {
+                        "minute_utc": delta_reference[0].isoformat(),
+                        "timestamp": delta_reference[0].isoformat(),
+                        "value": _json_value(delta_reference[1]),
+                    }
+                    if delta_reference is not None
+                    else None
+                ),
+                "source": source_metadata[condition.tag_key][absolute_index],
+            }
+        minute_evaluations.append(
+            MinuteEvaluation(
+                minute,
+                identities[visible_index],
+                primary_states[visible_index],
+                contributors[visible_index],
+                tuple(missing_by_index[absolute_index]),
+                {
+                    "conditions": condition_context,
+                    "groups": {
+                        str(key): value
+                        for key, value in group_results_by_index[visible_index].items()
+                    },
+                    "root_expression_result": root_results[visible_index],
+                    "active_condition_ids": list(contributors[visible_index]),
+                    "missing_tag_ids": missing_by_index[absolute_index],
+                },
+            )
+        )
+
     segments: list[Segment] = []
     segment_start = 0
     visible_grid = grid[visible_offset:]
@@ -384,34 +471,7 @@ def segment_timeline(
             continue
         boundary_visible_index = int((segment.start_utc - start) / MINUTE)
         absolute_index = visible_offset + boundary_visible_index
-        condition_context: dict[str, object] = {}
-        for condition in conditions:
-            delta_reference = refs_by_condition[condition.id][absolute_index]
-            pending_start = triggers_by_condition[condition.id][absolute_index]
-            confirmation = confirms_by_condition[condition.id][absolute_index]
-            condition_context[str(condition.id)] = {
-                "tag_key": condition.tag_key,
-                "display_name": condition.display_name,
-                "value": _json_value(values[condition.tag_key][absolute_index]),
-                "raw_predicate": raw_by_condition[condition.id][absolute_index],
-                "confirmed_active": lane_by_condition[condition.id][absolute_index]
-                is LaneState.ACTIVE,
-                "lane_state": lane_by_condition[condition.id][absolute_index].value,
-                "pending_start_utc": (
-                    pending_start.isoformat() if pending_start is not None else None
-                ),
-                "confirmation_utc": (
-                    confirmation.isoformat() if confirmation is not None else None
-                ),
-                "delta_reference": (
-                    {
-                        "timestamp": delta_reference[0].isoformat(),
-                        "value": _json_value(delta_reference[1]),
-                    }
-                    if delta_reference is not None
-                    else None
-                ),
-            }
+        minute_snapshot = minute_evaluations[boundary_visible_index].snapshot
         previous = segments[segment_index - 1].identity if segment_index else None
         if segment.system_state is SystemState.BREAK:
             explanation = (
@@ -434,9 +494,7 @@ def segment_timeline(
                 segment.contributing_condition_ids,
                 explanation,
                 {
-                    "conditions": condition_context,
-                    "groups": group_results_by_index[boundary_visible_index],
-                    "root_expression_result": root_results[boundary_visible_index],
+                    **minute_snapshot,
                     "missing_variables": missing_by_index[absolute_index],
                 },
             )
@@ -449,5 +507,11 @@ def segment_timeline(
             raise AssertionError("Primary segments overlap or contain a gap")
 
     return SegmentationResult(
-        start, end, source_row_count, tuple(segments), tuple(intervals), tuple(boundaries)
+        start,
+        end,
+        source_row_count,
+        tuple(segments),
+        tuple(intervals),
+        tuple(boundaries),
+        tuple(minute_evaluations),
     )

@@ -1,46 +1,51 @@
-# Source collector schema
+# Authoritative opcua_collector source mapping
 
-## Discovery status
+RecipeControl reads three collector-owned tables and never creates, alters, deletes from, or inserts into them: `machines`, `tags`, and `tag_samples`. Collector `poll_runs` and `machine_poll_runs` are also outside the application schema. A separate MySQL engine is created from `SOURCE_DATABASE_URL`; its account must be restricted to `SELECT`. The connection session is set to `+00:00`, and naive `DATETIME(6)` values are attached to UTC.
 
-No `db.py`, SQL, application files, or reachable source database configuration existed in the repository at discovery time (2026-07-14). Consequently, the live collector's database name, MySQL version, tables, relationships, primary key, value representation, timestamp type, and indexes cannot be truthfully mapped yet. RecipeControl does **not** invent these column names.
+`machines` provides `id`, `machine_name`, and `enabled`. `tags` provides `id`, `machine_id`, `node_id`, `opc_path`, nullable `display_name`, nullable `browse_name`, nullable `data_type`, and `enabled`. `tag_samples` provides the authoritative `sampled_at_utc`, numeric/text storage, quality/status/error fields, and deterministic `id`.
 
-All unresolved mappings are confined to `backend/recipecontrol/source/mysql.py`. That adapter fails closed until its explicitly named mapping environment variables are supplied. The rest of the application depends only on the `SourceDataRepository` protocol in `backend/recipecontrol/source/base.py` and runs with the deterministic fixture adapter.
+## Exact reads
 
-## Required source adapter contract
-
-The live adapter must provide:
-
-- machines: stable source key and display name;
-- tags for a machine: stable tag key, display name, source data type, and optional units;
-- samples for selected tag keys in a bounded half-open UTC interval;
-- for each sample: tag key, `sampled_at_utc`, typed/raw value, and a deterministic row tie-breaker.
-
-`sampled_at_utc` is authoritative UTC. A naive MySQL datetime is attached to UTC on ingestion. RecipeControl never forward-fills values. Rows are bucketed by UTC minute; greatest timestamp wins and the greatest deterministic source key breaks timestamp ties. SQL NULL is retained as missing.
-
-## Value normalization
-
-- Numeric values are parsed from lossless text into Python `Decimal`.
-- Text and alarm codes use direct typed comparison. A numeric alarm-code column should be mapped as numeric; a character column as text.
-- Boolean source mappings must identify the actual true/false encodings. The default adapter accepts database booleans and the canonical forms `true`, `false`, `1`, and `0`, case-insensitively.
-- SQL NULL is a Data Gap and is never coerced.
-
-## Query strategy and safety
-
-The source connection is configured independently with `SOURCE_DATABASE_URL` and is used only for parameterized `SELECT` and metadata/readiness operations. RecipeControl never migrates or writes the source database. Queries select only requested tags and bounded UTC ranges, including the engine-computed preload horizon. Sample reads are streamed/chunked by the adapter.
-
-The precise table/column mapping is supplied by environment variables documented in `.env.example`. Identifiers are allow-listed before SQL construction; values remain bound parameters.
-
-## Index review and recommendation
-
-Live index metadata was unavailable. After mapping the real schema, inspect `SHOW INDEX` read-only. If an equivalent composite index is absent, a source-database administrator may consider the following separately; RecipeControl never applies it:
+Enabled machines:
 
 ```sql
-CREATE INDEX ix_tag_samples_tag_time
-    ON tag_samples (tag_id, sampled_at_utc, id);
+SELECT id, machine_name
+FROM machines
+WHERE enabled = 1
+ORDER BY machine_name
 ```
 
-Replace names with discovered identifiers. The ordering supports bounded reads for selected tags plus deterministic latest-row selection. Validate write overhead and existing overlapping indexes before applying.
+Tag search selects enabled tags for one bound machine ID, searches lower-cased display name, browse name, node ID, and OPC path, and binds query, limit, and offset. Display name uses the first nonblank value from `display_name`, `browse_name`, and `node_id`.
 
-## Fixture schema
+Sample reads are machine-isolated and half-open:
 
-The fixture repository provides machines and tags for temperature, pressure, speed, alarm code, and motor-running, including duplicate-minute rows, tied timestamps, NULLs, missing rows, delta changes, and overlapping condition activity. It is a development/test source only and is not asserted to match the absent collector schema.
+```sql
+SELECT ts.id, ts.tag_id, ts.machine_id, ts.sampled_at_utc,
+       ts.value_numeric, ts.value_text, ts.quality,
+       ts.status_code, ts.error_text
+FROM tag_samples ts
+WHERE ts.machine_id = :machine_id
+  AND ts.tag_id IN (:tag_ids)
+  AND ts.sampled_at_utc >= :start_utc
+  AND ts.sampled_at_utc < :end_utc
+ORDER BY ts.sampled_at_utc, ts.tag_id, ts.id
+```
+
+The `IN` list uses SQLAlchemy expanding bound parameters. The June 11 19:50 through June 23 14:20 inclusive selection therefore reads through `2026-06-23 14:21:00 UTC` exclusive.
+
+## Data kinds and decoding
+
+Mapping is case-insensitive. `Byte`, `SByte`, signed/unsigned 16/32/64-bit integers, `Float`, `Double`, `Decimal`, `Number`, `Integer`, and `UInteger` map to `numeric`. `Boolean` maps to `boolean`. `String`, `Char`, `DateTime`, `Guid`, `LocalizedText`, missing declarations, and unknown nonnumeric declarations map to `text`.
+
+- Numeric snapshots use only `value_numeric`; arbitrary `value_text` is never parsed as a number.
+- Text/alarm-text snapshots use `value_text`; the empty string is valid.
+- Boolean snapshots accept numeric 0/1 or canonical case-insensitive text `true`, `false`, `0`, or `1`.
+- An unusable typed value is `NULL`/missing. Quality alone never changes a present typed value into Data Gap.
+
+The raw OPC type and normalized data kind are both snapshotted into a draft during save and resolved again immediately before lock. Locked snapshots are immutable if the collector tag is later renamed or retyped.
+
+## Safety and indexing
+
+`APP_DATABASE_URL` must use a different writable credential. Configuration rejects the same username on the same MySQL host/port as `SOURCE_DATABASE_URL`. Alembic contains operations only for `rc_*` tables.
+
+If absent, a collector administrator may separately review an index on `(machine_id, tag_id, sampled_at_utc, id)`. RecipeControl never applies collector indexes or grants.

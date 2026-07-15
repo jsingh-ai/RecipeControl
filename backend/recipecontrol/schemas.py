@@ -18,15 +18,22 @@ class MachineOut(ORMModel):
 class TagOut(BaseModel):
     key: str
     display_name: str
-    data_type: str
-    units: str | None
+    raw_data_type: str | None
+    data_kind: Literal["numeric", "text", "boolean"]
+    units: str | None = None
+    node_id: str | None = None
+    opc_path: str | None = None
 
 
 class ConditionWrite(BaseModel):
     id: int | None = None
-    source_tag_key: str
-    source_display_name: str
-    source_data_type: Literal["numeric", "text", "boolean"]
+    tag_id: str | None = None
+    # Accepted only for compatibility with older drafts. Authoritative metadata is
+    # always reloaded from the source before persistence.
+    source_tag_key: str | None = None
+    source_display_name: str | None = None
+    source_raw_data_type: str | None = None
+    source_data_type: Literal["numeric", "text", "boolean"] | None = None
     operator: Literal[
         "BELOW_MINIMUM",
         "ABOVE_MAXIMUM",
@@ -42,6 +49,14 @@ class ConditionWrite(BaseModel):
     delta_amount: str | None = None
     delta_window_minutes: int | None = Field(default=None, ge=1)
     duration_minutes: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def selected_tag(self) -> "ConditionWrite":
+        selected = self.tag_id or self.source_tag_key
+        if not selected:
+            raise ValueError("Choose a source tag")
+        self.tag_id = selected
+        return self
 
 
 class GroupWrite(BaseModel):

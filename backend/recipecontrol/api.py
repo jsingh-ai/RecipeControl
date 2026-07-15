@@ -17,6 +17,7 @@ from recipecontrol.database import as_utc, get_session, utc_now
 from recipecontrol.domain.engine import RuleEvaluationError, validate_rule
 from recipecontrol.models import (
     AnalysisJobModel,
+    AnalysisMinuteModel,
     AnalysisModel,
     BoundaryEventModel,
     ClassificationModel,
@@ -38,7 +39,13 @@ from recipecontrol.schemas import (
     SegmentLabelUpdate,
     TagOut,
 )
-from recipecontrol.services import draft_to_domain, replace_draft, version_to_domain
+from recipecontrol.services import (
+    draft_to_domain,
+    replace_draft,
+    resolve_authoritative_draft,
+    version_as_draft,
+    version_to_domain,
+)
 from recipecontrol.source import get_source_repository
 
 logger = logging.getLogger("recipecontrol.api")
@@ -53,8 +60,8 @@ def _version_dict(version: RuleVersionModel) -> dict[str, object]:
         "version_number": version.version_number,
         "root_operator": version.root_operator,
         "status": version.status,
-        "created_at": version.created_at,
-        "locked_at": version.locked_at,
+        "created_at": as_utc(version.created_at),
+        "locked_at": as_utc(version.locked_at) if version.locked_at else None,
         "groups": [
             {
                 "id": group.id,
@@ -66,6 +73,7 @@ def _version_dict(version: RuleVersionModel) -> dict[str, object]:
                         "position": item.position,
                         "source_tag_key": item.source_tag_key,
                         "source_display_name": item.source_display_name,
+                        "source_raw_data_type": item.source_raw_data_type,
                         "source_data_type": item.source_data_type,
                         "operator": item.operator,
                         "minimum": item.minimum,
@@ -89,15 +97,15 @@ def _analysis_dict(analysis: AnalysisModel) -> dict[str, object]:
         "title": analysis.title,
         "machine_id": analysis.machine_id,
         "rule_version_id": analysis.rule_version_id,
-        "selected_start_utc": analysis.selected_start_utc,
-        "selected_end_utc": analysis.selected_end_utc,
-        "end_exclusive_utc": analysis.end_exclusive_utc,
+        "selected_start_utc": as_utc(analysis.selected_start_utc),
+        "selected_end_utc": as_utc(analysis.selected_end_utc),
+        "end_exclusive_utc": as_utc(analysis.end_exclusive_utc),
         "mode": analysis.mode,
         "status": analysis.status,
         "duplicate_of_analysis_id": analysis.duplicate_of_analysis_id,
         "source_row_count": analysis.source_row_count,
         "error_message": analysis.error_message,
-        "created_at": analysis.created_at,
+        "created_at": as_utc(analysis.created_at),
     }
 
 
@@ -105,8 +113,8 @@ def _segment_dict(segment: SegmentModel) -> dict[str, object]:
     return {
         "id": segment.id,
         "analysis_id": segment.analysis_id,
-        "start_utc": segment.start_utc,
-        "end_utc": segment.end_utc,
+        "start_utc": as_utc(segment.start_utc),
+        "end_utc": as_utc(segment.end_utc),
         "system_state": segment.system_state,
         "identity_key": segment.identity_key,
         "contributing_condition_ids": segment.contributing_condition_ids,
@@ -116,7 +124,9 @@ def _segment_dict(segment: SegmentModel) -> dict[str, object]:
         "note": segment.note,
         "active_live": segment.active_live,
         "training_eligible": segment.training_eligible,
-        "label_updated_at": segment.label_updated_at,
+        "label_updated_at": (
+            as_utc(segment.label_updated_at) if segment.label_updated_at else None
+        ),
     }
 
 
@@ -162,24 +172,51 @@ async def machines(session: SessionDep) -> list[MachineModel]:
     )
 
 
-@router.get("/machines/{machine_id}/tags", response_model=list[TagOut])
-async def tags(machine_id: int, session: SessionDep, q: str = "") -> list[TagOut]:
+@router.get("/machines/{machine_id}/tags")
+async def tags(
+    machine_id: int,
+    session: SessionDep,
+    q: str = "",
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict[str, object]:
     machine = session.get(MachineModel, machine_id)
     if machine is None:
         raise HTTPException(404, "Machine not found")
-    return [
-        TagOut(key=tag.key, display_name=tag.display_name, data_type=tag.data_type, units=tag.units)
-        for tag in get_source_repository().search_tags(machine.source_key, q)
-    ]
+    try:
+        page = get_source_repository().search_tags(
+            machine.source_key, q, limit=limit, offset=offset
+        )
+    except Exception as error:
+        raise HTTPException(503, "Source database unavailable") from error
+    return {
+        "items": [
+            TagOut(
+                key=tag.key,
+                display_name=tag.display_name,
+                raw_data_type=tag.raw_data_type,
+                data_kind=tag.data_kind,
+                units=tag.units,
+                node_id=tag.node_id,
+                opc_path=tag.opc_path,
+            ).model_dump()
+            for tag in page.items
+        ],
+        "limit": page.limit,
+        "offset": page.offset,
+        "has_more": page.has_more,
+    }
 
 
 @router.get("/rule-sets")
 async def list_rule_sets(
-    session: SessionDep, machine_id: int | None = None
+    session: SessionDep, machine_id: int | None = None, include_archived: bool = False
 ) -> list[dict[str, object]]:
     statement = select(RuleSetModel).options(selectinload(RuleSetModel.versions))
     if machine_id is not None:
         statement = statement.where(RuleSetModel.machine_id == machine_id)
+    if not include_archived:
+        statement = statement.where(RuleSetModel.archived.is_(False))
     return [
         {
             "id": item.id,
@@ -236,12 +273,19 @@ async def update_draft(
     if version is None:
         raise HTTPException(404, "Rule version not found")
     try:
-        validate_rule(draft_to_domain(payload))
-        replace_draft(session, version, payload)
+        resolved = resolve_authoritative_draft(
+            payload, version.rule_set.machine.source_key, get_source_repository()
+        )
+        validate_rule(draft_to_domain(resolved))
+        replace_draft(session, version, resolved)
         session.commit()
     except (ValueError, RuleEvaluationError) as error:
         session.rollback()
         raise HTTPException(422, str(error)) from error
+    except Exception as error:
+        session.rollback()
+        logger.exception("source_tag_resolution_failed")
+        raise HTTPException(503, "Source database unavailable") from error
     return _version_dict(version)
 
 
@@ -253,9 +297,20 @@ async def lock_version(version_id: int, session: SessionDep) -> dict[str, object
     if version.status == "LOCKED":
         return _version_dict(version)
     try:
+        resolved = resolve_authoritative_draft(
+            version_as_draft(version),
+            version.rule_set.machine.source_key,
+            get_source_repository(),
+        )
+        replace_draft(session, version, resolved)
         validate_rule(version_to_domain(version))
     except (ValueError, RuleEvaluationError) as error:
+        session.rollback()
         raise HTTPException(422, str(error)) from error
+    except Exception as error:
+        session.rollback()
+        logger.exception("source_tag_resolution_failed")
+        raise HTTPException(503, "Source database unavailable") from error
     version.status = "LOCKED"
     version.locked_at = utc_now()
     session.commit()
@@ -465,18 +520,38 @@ async def timeline(analysis_id: int, session: SessionDep) -> dict[str, object]:
             {
                 "id": item.id,
                 "condition_id": item.condition_id,
-                "start_utc": item.start_utc,
-                "end_utc": item.end_utc,
+                "start_utc": as_utc(item.start_utc),
+                "end_utc": as_utc(item.end_utc),
                 "state": item.state,
-                "trigger_utc": item.trigger_utc,
-                "confirmation_utc": item.confirmation_utc,
+                "trigger_utc": as_utc(item.trigger_utc) if item.trigger_utc else None,
+                "confirmation_utc": (
+                    as_utc(item.confirmation_utc) if item.confirmation_utc else None
+                ),
             }
             for item in intervals
+        ],
+        "conditions": [
+            {
+                "id": condition.id,
+                "tag_id": condition.source_tag_key,
+                "display_name": condition.source_display_name,
+                "raw_data_type": condition.source_raw_data_type,
+                "data_kind": condition.source_data_type,
+                "operator": condition.operator,
+                "minimum": condition.minimum,
+                "maximum": condition.maximum,
+                "comparison_value": condition.comparison_value,
+                "delta_amount": condition.delta_amount,
+                "delta_window_minutes": condition.delta_window_minutes,
+                "duration_minutes": condition.duration_minutes,
+            }
+            for group in analysis.rule_version.groups
+            for condition in group.conditions
         ],
         "boundaries": [
             {
                 "id": item.id,
-                "boundary_utc": item.boundary_utc,
+                "boundary_utc": as_utc(item.boundary_utc),
                 "previous_identity": item.previous_identity,
                 "next_identity": item.next_identity,
                 "event_type": item.event_type,
@@ -485,6 +560,40 @@ async def timeline(analysis_id: int, session: SessionDep) -> dict[str, object]:
             }
             for item in boundaries
         ],
+    }
+
+
+@router.get("/analyses/{analysis_id}/minutes/{minute_utc}")
+async def exact_minute(
+    analysis_id: int, minute_utc: datetime, session: SessionDep
+) -> dict[str, object]:
+    if minute_utc.tzinfo is None or minute_utc.second or minute_utc.microsecond:
+        raise HTTPException(422, "minute_utc must be a timezone-aware minute")
+    minute = minute_utc.astimezone(UTC)
+    item = session.scalar(
+        select(AnalysisMinuteModel).where(
+            AnalysisMinuteModel.analysis_id == analysis_id,
+            AnalysisMinuteModel.minute_utc == minute,
+        )
+    )
+    if item is None:
+        raise HTTPException(404, "Exact-minute evaluation not found")
+    segment = session.get(SegmentModel, item.segment_id)
+    if segment is None:
+        raise HTTPException(404, "Minute segment not found")
+    if segment.system_state in {"DATA_GAP", "INSUFFICIENT_HISTORY"}:
+        training_reason = f"{segment.system_state.replace('_', ' ').title()} is training-ineligible"
+    elif segment.quality_label not in {"GOOD", "BAD"}:
+        training_reason = "A Good or Bad label is required"
+    else:
+        training_reason = None
+    return {
+        "analysis_id": analysis_id,
+        "minute_utc": minute,
+        "segment": _segment_dict(segment),
+        **item.snapshot,
+        "training_eligible": segment.training_eligible,
+        "training_ineligibility_reason": training_reason,
     }
 
 
@@ -561,14 +670,16 @@ async def trends(
     requested = tag_ids or sorted({condition.tag_key for condition in definition.conditions})
     machine = session.get(MachineModel, analysis.machine_id)
     assert machine is not None
-    metadata = {tag.key: tag for tag in get_source_repository().search_tags(machine.source_key)}
+    source = get_source_repository()
+    metadata = {tag.key: tag for tag in source.resolve_tags(machine.source_key, requested)}
     if any(tag not in metadata for tag in requested):
         raise HTTPException(422, "One or more tags do not belong to the analysis machine")
     start = clicked - timedelta(minutes=lookback_minutes - 1)
     chosen: dict[tuple[str, datetime], object] = {}
     ranks: dict[tuple[str, datetime], tuple[datetime, str]] = {}
-    for sample in get_source_repository().get_samples(
-        requested, start, clicked + timedelta(minutes=1)
+    tag_kinds = {tag: metadata[tag].data_kind for tag in requested}
+    for sample in source.get_samples(
+        machine.source_key, tag_kinds, start, clicked + timedelta(minutes=1)
     ):
         stamp = (
             sample.sampled_at_utc.replace(tzinfo=UTC)
@@ -589,7 +700,8 @@ async def trends(
             {
                 "tag_id": tag,
                 "display_name": metadata[tag].display_name,
-                "data_type": metadata[tag].data_type,
+                "data_type": metadata[tag].data_kind,
+                "raw_data_type": metadata[tag].raw_data_type,
                 "units": metadata[tag].units,
                 "points": [
                     {
@@ -659,12 +771,17 @@ async def live_latest(live_id: int, session: SessionDep) -> dict[str, object]:
     if live is None:
         raise HTTPException(404, "Live session not found")
     definition = version_to_domain(live.analysis.rule_version)
-    tags = sorted({condition.tag_key for condition in definition.conditions})
+    tag_kinds = {
+        condition.tag_key: condition.data_type.value for condition in definition.conditions
+    }
     now = utc_now()
     latest: dict[str, dict[str, object]] = {}
     latest_stamps: dict[str, datetime] = {}
     for sample in get_source_repository().get_samples(
-        tags, now - timedelta(minutes=5), now + timedelta(minutes=1)
+        live.analysis.machine.source_key,
+        tag_kinds,
+        now - timedelta(minutes=5),
+        now + timedelta(minutes=1),
     ):
         stamp = (
             sample.sampled_at_utc.replace(tzinfo=UTC)
@@ -719,7 +836,9 @@ def create_app() -> FastAPI:
     app = FastAPI(title="RecipeControl API", version="0.1.0")
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:5173"],
+        allow_origins=[
+            origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()
+        ],
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
