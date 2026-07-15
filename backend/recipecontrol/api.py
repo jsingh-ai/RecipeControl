@@ -1,14 +1,15 @@
 import logging
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
-from sqlalchemy import func, select, text
+from sqlalchemy import case, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -43,10 +44,12 @@ from recipecontrol.services import (
     draft_to_domain,
     replace_draft,
     resolve_authoritative_draft,
+    sync_machine_catalog,
     version_as_draft,
     version_to_domain,
 )
-from recipecontrol.source import get_source_repository
+from recipecontrol.source import dispose_source_repository, get_source_repository
+from recipecontrol.source.base import Tag
 
 logger = logging.getLogger("recipecontrol.api")
 router = APIRouter(prefix="/api")
@@ -106,6 +109,7 @@ def _analysis_dict(analysis: AnalysisModel) -> dict[str, object]:
         "source_row_count": analysis.source_row_count,
         "error_message": analysis.error_message,
         "created_at": as_utc(analysis.created_at),
+        "completed_at_utc": as_utc(analysis.completed_at) if analysis.completed_at else None,
     }
 
 
@@ -151,25 +155,17 @@ async def health(session: SessionDep) -> dict[str, object]:
 
 
 @router.get("/machines", response_model=list[MachineOut])
-async def machines(session: SessionDep) -> list[MachineModel]:
+async def machines(session: SessionDep, include_inactive: bool = False) -> list[MachineModel]:
     try:
-        for source_machine in get_source_repository().list_machines():
-            model = session.scalar(
-                select(MachineModel).where(MachineModel.source_key == source_machine.key)
-            )
-            if model is None:
-                session.add(MachineModel(source_key=source_machine.key, name=source_machine.name))
-            else:
-                model.name = source_machine.name
+        sync_machine_catalog(session, list(get_source_repository().list_machines()))
         session.commit()
     except Exception as error:
         session.rollback()
         raise HTTPException(503, "Source database unavailable") from error
-    return list(
-        session.scalars(
-            select(MachineModel).where(MachineModel.enabled).order_by(MachineModel.name)
-        )
-    )
+    statement = select(MachineModel)
+    if not include_inactive:
+        statement = statement.where(MachineModel.enabled)
+    return list(session.scalars(statement.order_by(MachineModel.name, MachineModel.id)))
 
 
 @router.get("/machines/{machine_id}/tags")
@@ -223,7 +219,12 @@ async def list_rule_sets(
             "machine_id": item.machine_id,
             "name": item.name,
             "archived": item.archived,
-            "versions": [_version_dict(version) for version in item.versions],
+            "versions": [
+                _version_dict(version)
+                for version in sorted(
+                    item.versions, key=lambda value: (value.version_number, value.id)
+                )
+            ],
         }
         for item in session.scalars(statement.order_by(RuleSetModel.name)).unique()
     ]
@@ -231,8 +232,11 @@ async def list_rule_sets(
 
 @router.post("/rule-sets", status_code=201)
 async def create_rule_set(payload: RuleSetCreate, session: SessionDep) -> dict[str, object]:
-    if session.get(MachineModel, payload.machine_id) is None:
+    machine = session.get(MachineModel, payload.machine_id)
+    if machine is None:
         raise HTTPException(404, "Machine not found")
+    if not machine.enabled:
+        raise HTTPException(422, "New definitions require an active source machine")
     item = RuleSetModel(machine_id=payload.machine_id, name=payload.name.strip())
     version = RuleVersionModel(version_number=1, root_operator="OR", status="DRAFT")
     item.versions.append(version)
@@ -272,6 +276,8 @@ async def update_draft(
     version = session.get(RuleVersionModel, version_id)
     if version is None:
         raise HTTPException(404, "Rule version not found")
+    if version.rule_set.archived or not version.rule_set.machine.enabled:
+        raise HTTPException(422, "Drafts require an active, non-archived definition")
     try:
         resolved = resolve_authoritative_draft(
             payload, version.rule_set.machine.source_key, get_source_repository()
@@ -296,6 +302,8 @@ async def lock_version(version_id: int, session: SessionDep) -> dict[str, object
         raise HTTPException(404, "Rule version not found")
     if version.status == "LOCKED":
         return _version_dict(version)
+    if version.rule_set.archived or not version.rule_set.machine.enabled:
+        raise HTTPException(422, "Drafts require an active, non-archived definition")
     try:
         resolved = resolve_authoritative_draft(
             version_as_draft(version),
@@ -322,6 +330,10 @@ async def new_blank_version(rule_set_id: int, session: SessionDep) -> dict[str, 
     item = session.get(RuleSetModel, rule_set_id)
     if item is None:
         raise HTTPException(404, "Rule set not found")
+    if item.archived:
+        raise HTTPException(422, "Archived definitions cannot create new versions")
+    if not item.machine.enabled:
+        raise HTTPException(422, "New versions require an active source machine")
     latest = session.scalar(
         select(func.max(RuleVersionModel.version_number)).where(
             RuleVersionModel.rule_set_id == rule_set_id
@@ -392,14 +404,21 @@ async def retire_classification(classification_id: int, session: SessionDep) -> 
 def _duplicates(
     session: Session, payload: AnalysisCreate, mode: str = "HISTORICAL"
 ) -> list[AnalysisModel]:
+    complete_first = case((AnalysisModel.status == "COMPLETE", 0), else_=1)
     return list(
         session.scalars(
-            select(AnalysisModel).where(
+            select(AnalysisModel)
+            .where(
                 AnalysisModel.machine_id == payload.machine_id,
                 AnalysisModel.rule_version_id == payload.rule_version_id,
                 AnalysisModel.selected_start_utc == payload.selected_start_utc,
                 AnalysisModel.selected_end_utc == payload.selected_end_utc,
                 AnalysisModel.mode == mode,
+            )
+            .order_by(
+                complete_first,
+                AnalysisModel.completed_at.desc(),
+                AnalysisModel.id.desc(),
             )
         )
     )
@@ -424,6 +443,10 @@ async def create_analysis(
     version = session.get(RuleVersionModel, payload.rule_version_id)
     if machine is None or version is None:
         raise HTTPException(404, "Machine or rule version not found")
+    if not machine.enabled:
+        raise HTTPException(422, "New analyses require an active source machine")
+    if version.rule_set.archived:
+        raise HTTPException(422, "Archived definitions cannot create new analyses")
     if version.status != "LOCKED" or version.rule_set.machine_id != machine.id:
         raise HTTPException(422, "Analysis requires a saved version for the selected machine")
     matches = _duplicates(session, payload)
@@ -434,7 +457,15 @@ async def create_analysis(
                 "code": "DUPLICATE_ANALYSIS",
                 "message": "An analysis already exists for this definition and period.",
                 "matches": [
-                    {"id": item.id, "status": item.status, "title": item.title} for item in matches
+                    {
+                        "id": item.id,
+                        "status": item.status,
+                        "title": item.title,
+                        "completed_at_utc": (
+                            as_utc(item.completed_at).isoformat() if item.completed_at else None
+                        ),
+                    }
+                    for item in matches
                 ],
             },
         )
@@ -610,9 +641,9 @@ async def get_segment(segment_id: int, session: SessionDep) -> dict[str, object]
     return _segment_dict(item)
 
 
-@router.patch("/segments/{segment_id}")
+@router.patch("/analyses/{analysis_id}/segments/{segment_id}")
 async def update_segment(
-    segment_id: int, payload: SegmentLabelUpdate, session: SessionDep
+    analysis_id: int, segment_id: int, payload: SegmentLabelUpdate, session: SessionDep
 ) -> dict[str, object]:
     settings = get_settings()
     if payload.note is not None and len(payload.note) > settings.note_max_length:
@@ -620,10 +651,14 @@ async def update_segment(
     segment = session.get(SegmentModel, segment_id)
     if segment is None:
         raise HTTPException(404, "Segment not found")
+    if segment.analysis_id != analysis_id:
+        raise HTTPException(409, "Segment does not belong to the selected analysis")
+    analysis = session.get(AnalysisModel, analysis_id)
+    if analysis is None:
+        raise HTTPException(404, "Analysis not found")
     classification = None
     if payload.classification_id is not None:
         classification = session.get(ClassificationModel, payload.classification_id)
-        analysis = session.get(AnalysisModel, segment.analysis_id)
         if (
             classification is None
             or not classification.active
@@ -666,14 +701,31 @@ async def trends(
     analysis = session.get(AnalysisModel, analysis_id)
     if analysis is None:
         raise HTTPException(404, "Analysis not found")
-    definition = version_to_domain(analysis.rule_version)
-    requested = tag_ids or sorted({condition.tag_key for condition in definition.conditions})
+    snapshot_metadata: dict[str, Tag] = {}
+    for condition in analysis.rule_version.groups:
+        for item in condition.conditions:
+            snapshot_metadata.setdefault(
+                item.source_tag_key,
+                Tag(
+                    item.source_tag_key,
+                    analysis.machine.source_key,
+                    item.source_display_name,
+                    item.source_raw_data_type,
+                    item.source_data_type,
+                ),
+            )
+    default_tags = sorted(snapshot_metadata)
+    extras = [tag for tag in (tag_ids or []) if tag not in snapshot_metadata]
+    requested = [*default_tags, *dict.fromkeys(extras)]
     machine = session.get(MachineModel, analysis.machine_id)
     assert machine is not None
     source = get_source_repository()
-    metadata = {tag.key: tag for tag in source.resolve_tags(machine.source_key, requested)}
-    if any(tag not in metadata for tag in requested):
-        raise HTTPException(422, "One or more tags do not belong to the analysis machine")
+    metadata = dict(snapshot_metadata)
+    if extras:
+        current = {tag.key: tag for tag in source.resolve_tags(machine.source_key, extras)}
+        if any(tag not in current for tag in extras):
+            raise HTTPException(422, "Temporary tags must be enabled and belong to the machine")
+        metadata.update(current)
     start = clicked - timedelta(minutes=lookback_minutes - 1)
     chosen: dict[tuple[str, datetime], object] = {}
     ranks: dict[tuple[str, datetime], tuple[datetime, str]] = {}
@@ -719,9 +771,18 @@ async def trends(
 
 @router.post("/live-sessions", status_code=201)
 async def start_live(payload: LiveCreate, session: SessionDep) -> dict[str, object]:
+    if not get_settings().enable_live_mode:
+        raise HTTPException(404, "Live mode is disabled")
     machine = session.get(MachineModel, payload.machine_id)
     version = session.get(RuleVersionModel, payload.rule_version_id)
-    if machine is None or version is None or version.status != "LOCKED":
+    if (
+        machine is None
+        or not machine.enabled
+        or version is None
+        or version.status != "LOCKED"
+        or version.rule_set.machine_id != machine.id
+        or version.rule_set.archived
+    ):
         raise HTTPException(422, "Live mode requires a valid machine and saved rule version")
     now = utc_now().replace(second=0, microsecond=0)
     analysis = AnalysisModel(
@@ -833,7 +894,13 @@ async def repair_live(live_id: int, session: SessionDep) -> dict[str, object]:
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title="RecipeControl API", version="0.1.0")
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        yield
+        dispose_source_repository()
+
+    app = FastAPI(title="RecipeControl API", version="0.1.0", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[

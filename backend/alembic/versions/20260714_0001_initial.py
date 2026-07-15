@@ -5,6 +5,8 @@ Revises:
 """
 
 import sqlalchemy as sa
+from sqlalchemy.dialects import mysql
+from sqlalchemy.sql.type_api import TypeEngine
 
 from alembic import op
 
@@ -14,10 +16,14 @@ branch_labels = None
 depends_on = None
 
 
+def _utc_datetime() -> TypeEngine[object]:
+    return sa.DateTime(timezone=True).with_variant(mysql.DATETIME(fsp=6), "mysql")
+
+
 def _timestamps() -> tuple[sa.Column[object], sa.Column[object]]:
     return (
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("created_at", _utc_datetime(), nullable=False),
+        sa.Column("updated_at", _utc_datetime(), nullable=False),
     )
 
 
@@ -48,8 +54,8 @@ def upgrade() -> None:
         sa.Column("version_number", sa.Integer(), nullable=False),
         sa.Column("root_operator", sa.String(3), nullable=False),
         sa.Column("status", sa.String(10), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("locked_at", sa.DateTime(timezone=True)),
+        sa.Column("created_at", _utc_datetime(), nullable=False),
+        sa.Column("locked_at", _utc_datetime()),
         sa.CheckConstraint("root_operator IN ('AND','OR')", name="ck_rule_root_operator"),
         sa.CheckConstraint("status IN ('DRAFT','LOCKED')", name="ck_rule_version_status"),
         sa.UniqueConstraint("rule_set_id", "version_number", name="uq_rule_version_number"),
@@ -99,8 +105,8 @@ def upgrade() -> None:
         ),
         sa.Column("name", sa.String(200), nullable=False),
         sa.Column("active", sa.Boolean(), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("retired_at", sa.DateTime(timezone=True)),
+        sa.Column("created_at", _utc_datetime(), nullable=False),
+        sa.Column("retired_at", _utc_datetime()),
         sa.UniqueConstraint("rule_version_id", "name", name="uq_classification_version_name"),
     )
     op.create_index(
@@ -114,18 +120,18 @@ def upgrade() -> None:
         sa.Column(
             "rule_version_id", sa.Integer(), sa.ForeignKey("rc_rule_version.id"), nullable=False
         ),
-        sa.Column("selected_start_utc", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("selected_end_utc", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("end_exclusive_utc", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("selected_start_utc", _utc_datetime(), nullable=False),
+        sa.Column("selected_end_utc", _utc_datetime(), nullable=False),
+        sa.Column("end_exclusive_utc", _utc_datetime(), nullable=False),
         sa.Column("mode", sa.String(12), nullable=False),
         sa.Column("status", sa.String(12), nullable=False),
         sa.Column("duplicate_of_analysis_id", sa.Integer(), sa.ForeignKey("rc_analysis.id")),
         sa.Column("source_row_count", sa.Integer()),
         sa.Column("reproducibility_metadata", sa.JSON()),
         sa.Column("error_message", sa.Text()),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("started_at", sa.DateTime(timezone=True)),
-        sa.Column("completed_at", sa.DateTime(timezone=True)),
+        sa.Column("created_at", _utc_datetime(), nullable=False),
+        sa.Column("started_at", _utc_datetime()),
+        sa.Column("completed_at", _utc_datetime()),
         sa.CheckConstraint("mode IN ('HISTORICAL','LIVE')", name="ck_analysis_mode"),
         sa.CheckConstraint(
             "status IN ('QUEUED','RUNNING','COMPLETE','FAILED','ACTIVE','STOPPED')",
@@ -152,10 +158,10 @@ def upgrade() -> None:
         sa.Column("state", sa.String(12), nullable=False),
         sa.Column("attempt_count", sa.Integer(), nullable=False),
         sa.Column("claimed_by", sa.String(100)),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("claimed_at", sa.DateTime(timezone=True)),
-        sa.Column("heartbeat_at", sa.DateTime(timezone=True)),
-        sa.Column("finished_at", sa.DateTime(timezone=True)),
+        sa.Column("created_at", _utc_datetime(), nullable=False),
+        sa.Column("claimed_at", _utc_datetime()),
+        sa.Column("heartbeat_at", _utc_datetime()),
+        sa.Column("finished_at", _utc_datetime()),
         sa.Column("error_details", sa.Text()),
     )
     op.create_index("ix_rc_analysis_job_state", "rc_analysis_job", ["state"])
@@ -163,8 +169,8 @@ def upgrade() -> None:
         "rc_segment",
         sa.Column("id", sa.Integer(), primary_key=True),
         sa.Column("analysis_id", sa.Integer(), sa.ForeignKey("rc_analysis.id"), nullable=False),
-        sa.Column("start_utc", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("end_utc", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("start_utc", _utc_datetime(), nullable=False),
+        sa.Column("end_utc", _utc_datetime(), nullable=False),
         sa.Column("system_state", sa.String(30), nullable=False),
         sa.Column("contributing_condition_ids", sa.JSON(), nullable=False),
         sa.Column("identity_key", sa.String(255), nullable=False),
@@ -173,7 +179,7 @@ def upgrade() -> None:
         sa.Column("classification_name_snapshot", sa.String(200)),
         sa.Column("note", sa.Text()),
         sa.Column("active_live", sa.Boolean(), nullable=False),
-        sa.Column("label_updated_at", sa.DateTime(timezone=True)),
+        sa.Column("label_updated_at", _utc_datetime()),
         sa.CheckConstraint(
             "system_state IN ('NORMAL','BREAK','DATA_GAP','INSUFFICIENT_HISTORY')",
             name="ck_segment_state",
@@ -193,7 +199,7 @@ def upgrade() -> None:
         sa.Column("classification_id", sa.Integer()),
         sa.Column("classification_name_snapshot", sa.String(200)),
         sa.Column("note", sa.Text()),
-        sa.Column("changed_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("changed_at", _utc_datetime(), nullable=False),
     )
     op.create_index("ix_rc_label_history_segment_id", "rc_label_history", ["segment_id"])
     op.create_table(
@@ -203,11 +209,11 @@ def upgrade() -> None:
         sa.Column(
             "condition_id", sa.Integer(), sa.ForeignKey("rc_rule_condition.id"), nullable=False
         ),
-        sa.Column("start_utc", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("end_utc", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("start_utc", _utc_datetime(), nullable=False),
+        sa.Column("end_utc", _utc_datetime(), nullable=False),
         sa.Column("state", sa.String(30), nullable=False),
-        sa.Column("trigger_utc", sa.DateTime(timezone=True)),
-        sa.Column("confirmation_utc", sa.DateTime(timezone=True)),
+        sa.Column("trigger_utc", _utc_datetime()),
+        sa.Column("confirmation_utc", _utc_datetime()),
         sa.Column("summary_metadata", sa.JSON()),
     )
     op.create_index(
@@ -220,7 +226,7 @@ def upgrade() -> None:
         "rc_boundary_event",
         sa.Column("id", sa.Integer(), primary_key=True),
         sa.Column("analysis_id", sa.Integer(), sa.ForeignKey("rc_analysis.id"), nullable=False),
-        sa.Column("boundary_utc", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("boundary_utc", _utc_datetime(), nullable=False),
         sa.Column("previous_identity", sa.String(255)),
         sa.Column("next_identity", sa.String(255), nullable=False),
         sa.Column("event_type", sa.String(30), nullable=False),
@@ -244,10 +250,10 @@ def upgrade() -> None:
         ),
         sa.Column("state", sa.String(12), nullable=False),
         sa.Column("finalization_lag_minutes", sa.Integer(), nullable=False),
-        sa.Column("last_finalized_minute", sa.DateTime(timezone=True)),
-        sa.Column("worker_heartbeat_at", sa.DateTime(timezone=True)),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("stopped_at", sa.DateTime(timezone=True)),
+        sa.Column("last_finalized_minute", _utc_datetime()),
+        sa.Column("worker_heartbeat_at", _utc_datetime()),
+        sa.Column("created_at", _utc_datetime(), nullable=False),
+        sa.Column("stopped_at", _utc_datetime()),
     )
     op.create_index("ix_rc_live_session_machine_id", "rc_live_session", ["machine_id"])
     op.create_index("ix_rc_live_session_rule_version_id", "rc_live_session", ["rule_version_id"])
@@ -259,7 +265,7 @@ def upgrade() -> None:
         ),
         sa.Column("checkpoint_key", sa.String(100), nullable=False),
         sa.Column("checkpoint_value", sa.JSON(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("updated_at", _utc_datetime(), nullable=False),
         sa.UniqueConstraint("live_session_id", "checkpoint_key", name="uq_live_checkpoint"),
     )
     op.create_index(

@@ -44,6 +44,10 @@ export function operatorsFor(dataType: DataKind): string[] {
   return ['EQUALS', 'NOT_EQUALS']
 }
 
+export function sortVersions(versions: RuleVersion[]): RuleVersion[] {
+  return [...versions].sort((left, right) => left.version_number - right.version_number || left.id - right.id)
+}
+
 export function serializeRule(values: RuleForm) {
   const parsed = ruleFormSchema.parse(values)
   return { root_operator: parsed.root_operator, groups: parsed.groups.map((group) => ({ internal_operator: group.internal_operator, conditions: group.conditions.map((condition) => ({ tag_id: condition.source_tag_key, operator: condition.operator, minimum: condition.minimum, maximum: condition.maximum, comparison_value: condition.comparison_value, delta_amount: condition.delta_amount, delta_window_minutes: condition.delta_window_minutes, duration_minutes: condition.duration_minutes })) })) }
@@ -69,6 +73,7 @@ export default function RuleBuilder() {
   })
   const groups = useFieldArray({ control: form.control, name: 'groups' })
   const watched = form.watch()
+  const selectedRuleSet = ruleSets.data?.find((item) => item.id === version?.rule_set_id)
 
   useEffect(() => {
     if (version) form.reset({
@@ -98,13 +103,13 @@ export default function RuleBuilder() {
     }),
     onSuccess: (data) => { setVersion(data.version); setNotice('Draft created. Add conditions, then save and lock it.'); queryClient.invalidateQueries({ queryKey: ['ruleSets'] }) },
   })
-  const save = useMutation({
-    mutationFn: async (values: RuleForm) => {
+  const persist = useMutation({
+    mutationFn: async ({ values, lock }: { values: RuleForm; lock: boolean }) => {
       if (!version) throw new Error('Create a draft first')
-      await api(`/rule-versions/${version.id}`, { method: 'PUT', body: JSON.stringify(serializeRule(values)) })
-      return api<RuleVersion>(`/rule-versions/${version.id}/lock`, { method: 'POST' })
+      const saved = await api<RuleVersion>(`/rule-versions/${version.id}`, { method: 'PUT', body: JSON.stringify(serializeRule(values)) })
+      return lock ? api<RuleVersion>(`/rule-versions/${version.id}/lock`, { method: 'POST' }) : saved
     },
-    onSuccess: (saved) => { setVersion(saved); setNotice(`Version ${saved.version_number} saved and locked.`); queryClient.invalidateQueries({ queryKey: ['ruleSets'] }) },
+    onSuccess: (saved, variables) => { setVersion(saved); setNotice(variables.lock ? `Version ${saved.version_number} saved and locked.` : `Draft version ${saved.version_number} saved.`); queryClient.invalidateQueries({ queryKey: ['ruleSets'] }) },
   })
   const newVersion = useMutation({
     mutationFn: () => api<RuleVersion>(`/rule-sets/${version!.rule_set_id}/versions`, { method: 'POST' }),
@@ -133,7 +138,7 @@ export default function RuleBuilder() {
 
     <section className="panel grid gap-4 md:grid-cols-[1fr_2fr_auto]">
       <label>Machine
-        <select aria-label="Machine" value={machineId} onChange={(event) => { setMachineId(Number(event.target.value) || ''); setVersion(null) }} disabled={Boolean(version)}>
+        <select aria-label="Machine" value={machineId} onChange={(event) => { setMachineId(Number(event.target.value) || ''); setVersion(null); form.reset({ root_operator: 'OR', groups: [{ internal_operator: 'AND', conditions: [blankCondition()] }] }) }} disabled={Boolean(version)}>
           <option value="">Choose machine</option>
           {machines.data?.map((machine) => <option key={machine.id} value={machine.id}>{machine.name}</option>)}
         </select>
@@ -145,9 +150,9 @@ export default function RuleBuilder() {
         : <div className="flex items-center gap-2 self-end"><span className="badge bg-slate-700">v{version.version_number} · {version.status}</span><button type="button" className="button-secondary" onClick={() => { setVersion(null); setName('') }}>Close</button></div>}
     </section>
 
-    {machineId && <section className="panel space-y-3" aria-label="Definition versions"><div className="flex items-center justify-between"><div><h2 className="text-lg font-semibold">Saved definitions</h2><p className="text-sm text-slate-400">Machine: {machines.data?.find((item) => item.id === machineId)?.name}</p></div><label className="flex-row items-center"><input type="checkbox" checked={showArchived} onChange={(event) => setShowArchived(event.target.checked)} /> Show archived</label></div>{ruleSets.isLoading && <p>Loading definitions…</p>}{ruleSets.data?.length === 0 && <p className="text-slate-400">No saved definitions for this machine.</p>}<div className="grid gap-2 md:grid-cols-2">{ruleSets.data?.map((ruleSet) => <article key={ruleSet.id} className="rounded-xl border border-slate-700 p-3"><div className="flex justify-between gap-2"><h3 className="font-semibold">{ruleSet.name}</h3>{ruleSet.archived && <span className="badge bg-slate-700">Archived</span>}</div><div className="mt-2 flex flex-wrap gap-2">{ruleSet.versions.map((item) => <button type="button" className="button-secondary" key={item.id} onClick={() => { setVersion(item); setName(ruleSet.name) }}>v{item.version_number} · {item.status}</button>)}</div>{!ruleSet.archived && <div className="mt-3 flex gap-2"><button type="button" className="button-secondary" onClick={() => { const selected = ruleSet.versions.at(-1); if (selected) setVersion(selected) }}>Open latest</button><button type="button" className="button-secondary text-red-300" disabled={archive.isPending} onClick={() => archive.mutate(ruleSet.id)}>Archive</button></div>}</article>)}</div></section>}
+    {machineId && <section className="panel space-y-3" aria-label="Definition versions"><div className="flex items-center justify-between"><div><h2 className="text-lg font-semibold">Saved definitions</h2><p className="text-sm text-slate-400">Machine: {machines.data?.find((item) => item.id === machineId)?.name}</p></div><label className="flex-row items-center"><input type="checkbox" checked={showArchived} onChange={(event) => setShowArchived(event.target.checked)} /> Show archived</label></div>{ruleSets.isLoading && <p>Loading definitions…</p>}{ruleSets.data?.length === 0 && <p className="text-slate-400">No saved definitions for this machine.</p>}<div className="grid gap-2 md:grid-cols-2">{ruleSets.data?.map((ruleSet) => { const ordered = sortVersions(ruleSet.versions); return <article key={ruleSet.id} className="rounded-xl border border-slate-700 p-3"><div className="flex justify-between gap-2"><h3 className="font-semibold">{ruleSet.name}</h3>{ruleSet.archived && <span className="badge bg-slate-700">Archived</span>}</div><div className="mt-2 flex flex-wrap gap-2">{ordered.map((item) => <button type="button" className="button-secondary" key={item.id} onClick={() => { setVersion(item); setName(ruleSet.name) }}>v{item.version_number} · {item.status}</button>)}</div>{!ruleSet.archived && <div className="mt-3 flex gap-2"><button type="button" className="button-secondary" onClick={() => { const selected = ordered.at(-1); if (selected) setVersion(selected) }}>Open latest</button><button type="button" className="button-secondary text-red-300" disabled={archive.isPending} onClick={() => archive.mutate(ruleSet.id)}>Archive</button></div>}</article> })}</div></section>}
 
-    {version && <form className="space-y-4" onSubmit={form.handleSubmit((values) => save.mutate(values))}>
+    {version && <form className="space-y-4" onSubmit={(event) => event.preventDefault()}>
       <section className="panel flex flex-wrap items-end gap-4">
         <label>Root operator between groups
           <select aria-label="Root operator" {...form.register('root_operator')} disabled={version.status === 'LOCKED'}><option>OR</option><option>AND</option></select>
@@ -168,7 +173,11 @@ export default function RuleBuilder() {
           const type = condition.source_data_type
           const operator = condition.operator
           return <div className="grid gap-3 rounded-xl border border-slate-700 p-4 lg:grid-cols-6" key={`${groupIndex}-${conditionIndex}`} data-testid="condition-row">
-            <div className="lg:col-span-2"><TagSearch label={`Variable ${conditionIndex + 1}`} machineId={Number(machineId)} disabled={version.status === 'LOCKED'} value={condition.source_tag_key ? { key: condition.source_tag_key, display_name: condition.source_display_name, raw_data_type: condition.source_raw_data_type ?? null, data_kind: condition.source_data_type } as Tag : null} exclude={watched.groups.flatMap((item) => (item.conditions ?? []).map((candidate) => candidate.source_tag_key)).filter((key) => key && key !== condition.source_tag_key)} onSelect={(selected) => {
+            <div className="lg:col-span-2"><TagSearch label={`Variable ${conditionIndex + 1}`} machineId={Number(machineId)} disabled={version.status === 'LOCKED'} value={condition.source_tag_key ? { key: condition.source_tag_key, display_name: condition.source_display_name, raw_data_type: condition.source_raw_data_type ?? null, data_kind: condition.source_data_type } as Tag : null} onClear={() => {
+                form.setValue(`groups.${groupIndex}.conditions.${conditionIndex}.source_tag_key`, '', { shouldValidate: true })
+                form.setValue(`groups.${groupIndex}.conditions.${conditionIndex}.source_display_name`, '', { shouldValidate: true })
+                form.setValue(`groups.${groupIndex}.conditions.${conditionIndex}.source_raw_data_type`, null)
+              }} onSelect={(selected) => {
                 form.setValue(`groups.${groupIndex}.conditions.${conditionIndex}.source_tag_key`, selected.key)
                 form.setValue(`groups.${groupIndex}.conditions.${conditionIndex}.source_display_name`, selected.display_name)
                 form.setValue(`groups.${groupIndex}.conditions.${conditionIndex}.source_raw_data_type`, selected.raw_data_type)
@@ -180,13 +189,13 @@ export default function RuleBuilder() {
                 {operatorsFor(type).map((item) => <option key={item} value={item}>{item.replaceAll('_', ' ')}</option>)}
               </select>
             </label>
-            {operator === 'BELOW_MINIMUM' && <label>Minimum<input type="number" step="any" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.minimum`)} /></label>}
-            {operator === 'ABOVE_MAXIMUM' && <label>Maximum<input type="number" step="any" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.maximum`)} /></label>}
-            {operator === 'OUTSIDE_RANGE' && <><label>Minimum<input type="number" step="any" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.minimum`)} /></label><label>Maximum<input type="number" step="any" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.maximum`)} /></label></>}
+            {operator === 'BELOW_MINIMUM' && <label>Minimum<input disabled={version.status === 'LOCKED'} type="number" step="any" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.minimum`)} /></label>}
+            {operator === 'ABOVE_MAXIMUM' && <label>Maximum<input disabled={version.status === 'LOCKED'} type="number" step="any" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.maximum`)} /></label>}
+            {operator === 'OUTSIDE_RANGE' && <><label>Minimum<input disabled={version.status === 'LOCKED'} type="number" step="any" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.minimum`)} /></label><label>Maximum<input disabled={version.status === 'LOCKED'} type="number" step="any" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.maximum`)} /></label></>}
             {['EQUALS', 'NOT_EQUALS'].includes(operator) && <label>Comparison
-              {type === 'boolean' ? <select {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.comparison_value`)}><option value="true">true</option><option value="false">false</option></select> : <input type={type === 'numeric' ? 'number' : 'text'} step="any" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.comparison_value`)} />}
+              {type === 'boolean' ? <select disabled={version.status === 'LOCKED'} {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.comparison_value`)}><option value="true">true</option><option value="false">false</option></select> : <input disabled={version.status === 'LOCKED'} type={type === 'numeric' ? 'number' : 'text'} step="any" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.comparison_value`)} />}
             </label>}
-            {['INCREASE_BY', 'DECREASE_BY'].includes(operator) && <><label>Delta amount<input type="number" min="0" step="any" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.delta_amount`)} /></label><label>Window minutes<input type="number" min="1" step="1" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.delta_window_minutes`)} /></label></>}
+            {['INCREASE_BY', 'DECREASE_BY'].includes(operator) && <><label>Delta amount<input disabled={version.status === 'LOCKED'} type="number" min="0" step="any" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.delta_amount`)} /></label><label>Window minutes<input disabled={version.status === 'LOCKED'} type="number" min="1" step="1" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.delta_window_minutes`)} /></label></>}
             <label>Activation minutes<input type="number" min="0" step="1" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.duration_minutes`)} disabled={version.status === 'LOCKED'} /></label>
             <button type="button" className="button-secondary self-end" disabled={version.status === 'LOCKED'} onClick={() => removeCondition(groupIndex, conditionIndex)}>Remove</button>
           </div>
@@ -195,11 +204,11 @@ export default function RuleBuilder() {
       </section>)}
 
       <div className="flex gap-3">
-        {version.status === 'DRAFT' && <><button type="button" className="button-secondary" onClick={() => groups.append({ internal_operator: 'AND', conditions: [blankCondition()] })}>Add Group</button><button className="button-primary" type="submit" disabled={save.isPending}>Save & Lock Version</button></>}
-        {version.status === 'LOCKED' && <button type="button" className="button-primary" onClick={() => newVersion.mutate()}>Create New Blank Version</button>}
+        {version.status === 'DRAFT' && <><button type="button" className="button-secondary" onClick={() => groups.append({ internal_operator: 'AND', conditions: [blankCondition()] })}>Add Group</button><button className="button-secondary" type="button" disabled={persist.isPending} onClick={form.handleSubmit((values) => persist.mutate({ values, lock: false }))}>Save Draft</button><button className="button-primary" type="button" disabled={persist.isPending} onClick={form.handleSubmit((values) => persist.mutate({ values, lock: true }))}>Save & Lock Version</button></>}
+        {version.status === 'LOCKED' && !selectedRuleSet?.archived && <button type="button" className="button-primary" onClick={() => newVersion.mutate()}>Create New Blank Version</button>}
       </div>
       {Object.keys(form.formState.errors).length > 0 && <p role="alert" className="text-red-300">Fix the highlighted rule fields. Every saved group needs a valid condition.</p>}
     </form>}
-    {(notice || create.error || save.error) && <p role="status" className="panel">{notice || create.error?.message || save.error?.message}</p>}
+    {(notice || create.error || persist.error || newVersion.error) && <p role={create.error || persist.error || newVersion.error ? 'alert' : 'status'} className="panel">{notice || create.error?.message || persist.error?.message || newVersion.error?.message}</p>}
   </main>
 }

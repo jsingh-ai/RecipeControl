@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import delete, select
 
+from recipecontrol.config import get_settings
 from recipecontrol.database import SessionLocal, as_utc, utc_now
 from recipecontrol.domain.engine import segment_timeline
 from recipecontrol.models import (
@@ -14,7 +15,7 @@ from recipecontrol.models import (
     SegmentModel,
 )
 from recipecontrol.services import version_to_domain
-from recipecontrol.source import get_source_repository
+from recipecontrol.source import dispose_source_repository, get_source_repository
 
 logger = logging.getLogger("recipecontrol.live_worker")
 
@@ -212,12 +213,18 @@ def main() -> None:
     parser.add_argument("--poll-seconds", type=float, default=10.0)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
-    if args.once:
-        process_live_once()
-        return
-    while True:
-        process_live_once()
-        time.sleep(args.poll_seconds)
+    try:
+        if not get_settings().enable_live_mode:
+            logger.warning("Live mode is disabled; no sessions will be processed.")
+            return
+        if args.once:
+            process_live_once()
+            return
+        while True:
+            process_live_once()
+            time.sleep(args.poll_seconds)
+    finally:
+        dispose_source_repository()
 
 
 if __name__ == "__main__":

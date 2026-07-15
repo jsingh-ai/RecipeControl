@@ -13,18 +13,17 @@ make migrate
 make seed
 ```
 
-Run these four processes in separate terminals:
+Run these three processes in separate terminals:
 
 ```bash
 make backend
 make worker
-make live-worker
 make frontend
 ```
 
 Open `http://localhost:5173`. API documentation is at `http://localhost:8000/docs`; readiness details are at `http://localhost:8000/api/health`.
 
-The fixture source supports any UTC range. The timeline form includes the requested preset from `2026-06-11 19:50` through `2026-06-23 14:20` UTC. Historical analyses are queued; keep `make worker` running. Live sessions need `make live-worker`.
+The fixture source supports any UTC range. The timeline form includes the requested preset from `2026-06-11 19:50` through `2026-06-23 14:20` UTC. Historical analyses are queued; keep `make worker` running. Live mode is experimental and disabled by default.
 
 ## Docker development
 
@@ -45,12 +44,21 @@ The default remains `SOURCE_ADAPTER=fixture`. To use the authoritative `opcua_co
 3. Keep `APP_DATABASE_URL` on a separate writable database/account. Startup rejects reuse of the source username on the same host and port.
 4. Run `make seed`, then inspect `/api/health` and paginated tag search.
 
+Verify the source account while connected as that account:
+
+```sql
+SHOW GRANTS FOR CURRENT_USER;
+```
+
+It should have `SELECT` only on the collector schema. MySQL 8.0 or newer is required for the supported application and integration-test schema.
+
 The adapter contains only the fixed `machines`, `tags`, and `tag_samples` reads documented below. Query values are bound, the session time zone is `+00:00`, and Alembic uses only `APP_DATABASE_URL`. Never point `APP_DATABASE_URL` at the collector database.
 
 Read-only source smoke commands:
 
 ```bash
 .venv/bin/recipecontrol-source-smoke health
+.venv/bin/recipecontrol-source-smoke diagnostics
 .venv/bin/recipecontrol-source-smoke machines
 .venv/bin/recipecontrol-source-smoke tags --machine 1 --query temperature --limit 20
 .venv/bin/recipecontrol-source-smoke range --machine 1
@@ -73,10 +81,15 @@ make lint           # Ruff format/check and ESLint
 make typecheck      # mypy and TypeScript
 make test-backend   # Pytest unit/integration suite
 make test-frontend  # Vitest/Testing Library suite
+make test-mysql-up  # start isolated collector/application MySQL test services
+make test-mysql     # exact collector schema + application MySQL historical workflow
+make test-mysql-down # remove isolated MySQL test services and volumes
+make test-mysql-all # run the three MySQL steps with cleanup on exit
 make e2e            # Playwright critical workflow
 make e2e-real       # unmocked migrated API + worker + fixture + frontend workflow
 make build          # production frontend build
 make checks         # every check above plus Playwright
+make verify         # local checks, real-stack browser flow, and isolated MySQL tests
 ```
 
 First-time Playwright setup:
@@ -110,14 +123,20 @@ Downgrade the application schema:
 7. Reload the saved analysis and verify the label. Retire the classification and confirm the existing segment keeps its snapshot.
 8. Analyze the same range again and choose Open Existing or Create New.
 9. Toggle UTC/Central and verify daylight-aware `America/Chicago` presentation.
-10. Start Live, observe the active dashed segment, pause auto-follow, confirm processing continues, and stop the session.
+10. Archive the definition and verify the saved analysis, exact-minute details, trends, classifications, notes, and labels remain available.
+
+The same source tag may be selected in multiple conditions. Each condition receives its own stable condition ID, so `Temperature > 250` and `Temperature increases by 5 over 10 minutes` remain distinct break reasons.
+
+## Live-mode status
+
+Historical analysis is the supported MVP. `ENABLE_LIVE_MODE=false` and `VITE_ENABLE_LIVE_MODE=false` are the defaults. The API refuses new live sessions and the frontend hides the live start control while disabled. Do not enable live labeling until the remaining boundary/annotation and late-arrival behavior in `docs/live-mode.md` is fully tested.
 
 ## Troubleshooting
 
 - `no such table`: run `make migrate` with the same `APP_DATABASE_URL` used by the API and workers.
 - Analysis remains queued: start `make worker`; inspect the analysis job status and server logs.
 - A worker that stops heartbeating is reclaimed after `STALE_JOB_TIMEOUT_SECONDS`; jobs fail with a sanitized message after `HISTORICAL_JOB_MAX_ATTEMPTS`.
-- Live heartbeat is stale: start `make live-worker` and confirm all processes share `APP_DATABASE_URL`.
+- Live mode is unavailable: this is expected while `ENABLE_LIVE_MODE=false`; historical analysis remains fully available.
 - Source health fails: verify the read-only URL, network path, and exact mapping variables. Errors returned to the browser are intentionally redacted.
 - MySQL datetime appears naive: the adapter intentionally attaches UTC because `sampled_at_utc` is authoritative UTC.
 - Browser test cannot launch: run `npx playwright install chromium` in `frontend`.

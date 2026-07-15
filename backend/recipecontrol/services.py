@@ -10,9 +10,24 @@ from recipecontrol.domain.models import (
     LogicOperator,
     RuleDefinition,
 )
-from recipecontrol.models import RuleVersionModel
+from recipecontrol.models import MachineModel, RuleVersionModel
 from recipecontrol.schemas import DraftWrite
-from recipecontrol.source.base import SourceDataRepository
+from recipecontrol.source.base import Machine, SourceDataRepository
+
+
+def sync_machine_catalog(session: Session, source_machines: list[Machine]) -> None:
+    current = {machine.key: machine for machine in source_machines}
+    local = {machine.source_key: machine for machine in session.query(MachineModel).all()}
+    for source_key, machine in current.items():
+        stored = local.get(source_key)
+        if stored is None:
+            session.add(MachineModel(source_key=source_key, name=machine.name, enabled=True))
+        else:
+            stored.name = machine.name
+            stored.enabled = True
+    for source_key, stored in local.items():
+        if source_key not in current:
+            stored.enabled = False
 
 
 def configured_value(data_type: DataType, value: object | None) -> Decimal | str | bool | None:
@@ -140,9 +155,9 @@ def resolve_authoritative_draft(
     selected = [
         condition.tag_id or "" for group in payload.groups for condition in group.conditions
     ]
-    if len(selected) != len(set(selected)):
-        raise ValueError("A source tag may only be selected once in a rule version")
-    resolved = {tag.key: tag for tag in source.resolve_tags(machine_key, selected)}
+    resolved = {
+        tag.key: tag for tag in source.resolve_tags(machine_key, list(dict.fromkeys(selected)))
+    }
     missing = [key for key in selected if key not in resolved]
     if missing:
         raise ValueError(

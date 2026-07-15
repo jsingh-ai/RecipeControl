@@ -56,6 +56,7 @@ export type Analysis = {
 }
 export type Segment = {
   id: number
+  analysis_id: number
   start_utc: string
   end_utc: string
   system_state: 'NORMAL' | 'BREAK' | 'DATA_GAP' | 'INSUFFICIENT_HISTORY'

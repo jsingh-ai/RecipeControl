@@ -5,6 +5,8 @@ Revises: 20260714_0001
 """
 
 import sqlalchemy as sa
+from sqlalchemy.dialects import mysql
+from sqlalchemy.sql.type_api import TypeEngine
 
 from alembic import op
 
@@ -12,6 +14,10 @@ revision = "20260715_0002"
 down_revision = "20260714_0001"
 branch_labels = None
 depends_on = None
+
+
+def _utc_datetime() -> TypeEngine[object]:
+    return sa.DateTime(timezone=True).with_variant(mysql.DATETIME(fsp=6), "mysql")
 
 
 def upgrade() -> None:
@@ -23,7 +29,7 @@ def upgrade() -> None:
         sa.Column("id", sa.Integer(), primary_key=True),
         sa.Column("analysis_id", sa.Integer(), sa.ForeignKey("rc_analysis.id"), nullable=False),
         sa.Column("segment_id", sa.Integer(), sa.ForeignKey("rc_segment.id"), nullable=False),
-        sa.Column("minute_utc", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("minute_utc", _utc_datetime(), nullable=False),
         sa.Column("system_state", sa.String(30), nullable=False),
         sa.Column("snapshot", sa.JSON(), nullable=False),
         sa.UniqueConstraint("analysis_id", "minute_utc", name="uq_analysis_minute"),

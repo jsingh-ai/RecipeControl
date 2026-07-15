@@ -17,8 +17,29 @@ TAGS = (
 class FixtureSourceDataRepository:
     """Deterministic source with generated rows for any requested UTC range."""
 
+    def dispose(self) -> None:
+        return None
+
     def health(self) -> dict[str, object]:
         return {"ok": True, "adapter": "fixture", "mysql_version": None}
+
+    def diagnostics(self) -> dict[str, object]:
+        type_counts: dict[tuple[str | None, str], int] = {}
+        for tag in TAGS:
+            key = (tag.raw_data_type, tag.data_kind)
+            type_counts[key] = type_counts.get(key, 0) + 1
+        return {
+            "adapter": "fixture",
+            "enabled_machine_count": 1,
+            "enabled_tag_count": len(TAGS),
+            "data_types": [
+                {"raw_data_type": raw_type, "count": count, "data_kind": data_kind}
+                for (raw_type, data_kind), count in sorted(
+                    type_counts.items(), key=lambda item: str(item[0][0])
+                )
+            ],
+            "sample_bounds": [],
+        }
 
     def list_machines(self) -> Sequence[Machine]:
         return (MACHINE,)

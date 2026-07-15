@@ -2,6 +2,15 @@
 
 RecipeControl reads three collector-owned tables and never creates, alters, deletes from, or inserts into them: `machines`, `tags`, and `tag_samples`. Collector `poll_runs` and `machine_poll_runs` are also outside the application schema. A separate MySQL engine is created from `SOURCE_DATABASE_URL`; its account must be restricted to `SELECT`. The connection session is set to `+00:00`, and naive `DATETIME(6)` values are attached to UTC.
 
+Verify the configured source account directly as that account:
+
+```sql
+SHOW GRANTS FOR CURRENT_USER;
+```
+
+The result should grant `SELECT` only on the collector schema. RecipeControl does
+not require `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `ALTER`, or `DROP` there.
+
 `machines` provides `id`, `machine_name`, and `enabled`. `tags` provides `id`, `machine_id`, `node_id`, `opc_path`, nullable `display_name`, nullable `browse_name`, nullable `data_type`, and `enabled`. `tag_samples` provides the authoritative `sampled_at_utc`, numeric/text storage, quality/status/error fields, and deterministic `id`.
 
 ## Exact reads
@@ -35,7 +44,11 @@ The `IN` list uses SQLAlchemy expanding bound parameters. The June 11 19:50 thro
 
 ## Data kinds and decoding
 
-Mapping is case-insensitive. `Byte`, `SByte`, signed/unsigned 16/32/64-bit integers, `Float`, `Double`, `Decimal`, `Number`, `Integer`, and `UInteger` map to `numeric`. `Boolean` maps to `boolean`. `String`, `Char`, `DateTime`, `Guid`, `LocalizedText`, missing declarations, and unknown nonnumeric declarations map to `text`.
+Mapping is case-insensitive and strips common namespaces/prefixes. `Byte`, `SByte`, signed/unsigned integer families, `Float`, `Float32`, `Float64`, `Double`, `Decimal`, `Number`, `Integer`, and `UInteger` map to `numeric`; forms such as `VariantType.Double` and `Opc.Ua.Double` therefore normalize correctly. `Boolean` and `System.Boolean` map to `boolean`. `String`, `Char`, `DateTime`, `Guid`, `LocalizedText`, and other clearly textual declarations remain text even if numeric storage is populated. For an unknown declaration, observed numeric storage is a numeric fallback and canonical Boolean text is a Boolean fallback. Arbitrary text is never parsed as numeric.
+
+Run `.venv/bin/recipecontrol-source-smoke diagnostics` to report enabled machine/tag
+counts, distinct raw type values with normalized kinds, and per-machine sample bounds.
+The report contains no connection URL, username, password, or endpoint secret.
 
 - Numeric snapshots use only `value_numeric`; arbitrary `value_text` is never parsed as a number.
 - Text/alarm-text snapshots use `value_text`; the empty string is valid.

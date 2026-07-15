@@ -5,7 +5,15 @@ import pytest
 from pydantic import ValidationError
 
 from recipecontrol.config import Settings
-from recipecontrol.source.mysql import decode_typed_value, display_name, normalize_data_kind
+from recipecontrol.source.factory import dispose_source_repository, get_source_repository
+from recipecontrol.source.mysql import (
+    MACHINE_SELECT,
+    SAMPLE_SELECT,
+    TAG_SELECT_PREFIX,
+    decode_typed_value,
+    display_name,
+    normalize_data_kind,
+)
 
 
 @pytest.mark.parametrize(
@@ -35,6 +43,27 @@ def test_boolean_and_text_type_mapping() -> None:
     assert normalize_data_kind("bOoLeAn") == "boolean"
     for raw_type in ("String", "Char", "DateTime", "Guid", "LocalizedText", "CustomAlarm"):
         assert normalize_data_kind(raw_type) == "text"
+
+
+@pytest.mark.parametrize(
+    ("raw_type", "expected"),
+    [
+        ("VariantType.Double", "numeric"),
+        ("Opc.Ua.Double", "numeric"),
+        ("Float64", "numeric"),
+        ("System.Boolean", "boolean"),
+        ("Opc.Ua.String", "text"),
+    ],
+)
+def test_prefixed_and_decorated_opc_types(raw_type: str, expected: str) -> None:
+    assert normalize_data_kind(raw_type) == expected
+
+
+def test_observed_storage_is_only_a_safe_unknown_type_fallback() -> None:
+    assert normalize_data_kind("CustomNumeric", observed_numeric=True) == "numeric"
+    assert normalize_data_kind("CustomFlag", observed_boolean=True) == "boolean"
+    assert normalize_data_kind("String", observed_numeric=True) == "text"
+    assert normalize_data_kind("Boolean", observed_numeric=True) == "boolean"
 
 
 def test_display_name_fallback_ignores_blanks() -> None:
@@ -78,4 +107,21 @@ def test_collector_read_only_credential_cannot_be_reused_for_application_writes(
             source_database_url=(
                 "mysql+pymysql://collector_reader:secret@app-db:3306/opcua_collector"
             ),
+        )
+
+
+def test_process_local_source_repository_is_reused() -> None:
+    dispose_source_repository()
+    try:
+        assert get_source_repository() is get_source_repository()
+    finally:
+        dispose_source_repository()
+
+
+def test_collector_table_statements_are_select_only() -> None:
+    for statement in (MACHINE_SELECT, TAG_SELECT_PREFIX, SAMPLE_SELECT):
+        assert statement.lstrip().upper().startswith("SELECT")
+        assert not any(
+            keyword in statement.upper()
+            for keyword in ("INSERT INTO", "UPDATE ", "DELETE FROM", "ALTER TABLE", "DROP TABLE")
         )
