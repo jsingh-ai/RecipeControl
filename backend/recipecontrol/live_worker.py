@@ -49,9 +49,13 @@ def process_live_once(now: datetime | None = None) -> int:
                     last_finalized - timedelta(minutes=definition.preload_minutes),
                 )
             )
-            tag_keys = sorted({condition.tag_key for condition in definition.conditions})
+            tag_kinds = {
+                condition.tag_key: condition.data_type.value for condition in definition.conditions
+            }
             preload = recompute_start - timedelta(minutes=definition.preload_minutes)
-            samples = source.get_samples(tag_keys, preload, target + timedelta(minutes=1))
+            samples = source.get_samples(
+                analysis.machine.source_key, tag_kinds, preload, target + timedelta(minutes=1)
+            )
             result = segment_timeline(definition, samples, recompute_start, target)
             affected_segments = list(
                 session.scalars(

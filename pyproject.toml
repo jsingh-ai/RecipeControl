@@ -30,6 +30,7 @@ dev = [
 [project.scripts]
 recipecontrol-worker = "recipecontrol.worker:main"
 recipecontrol-live-worker = "recipecontrol.live_worker:main"
+recipecontrol-source-smoke = "recipecontrol.source_smoke:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["backend/recipecontrol"]

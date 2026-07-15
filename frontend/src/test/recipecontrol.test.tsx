@@ -97,7 +97,8 @@ describe('analysis workflow', () => {
     vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input); requested.push(url)
       if (url.includes('/classifications')) return response([{ id: 4, name: 'Normal Production', active: true }])
-      if (url.includes('/machines/1/tags')) return response([{ key: 'temperature', display_name: 'Temperature', data_type: 'numeric' }, { key: 'speed', display_name: 'Speed', data_type: 'numeric' }])
+      if (url.includes('/machines/1/tags')) return response({ items: [{ key: 'temperature', display_name: 'Temperature', raw_data_type: 'Double', data_kind: 'numeric' }, { key: 'speed', display_name: 'Speed', raw_data_type: 'Double', data_kind: 'numeric' }], limit: 25, offset: 0, has_more: false })
+      if (url.includes('/minutes/')) return response({ conditions: {}, active_condition_ids: [], missing_tag_ids: [], groups: {}, root_expression_result: true, training_eligible: false, training_ineligibility_reason: 'A Good or Bad label is required' })
       if (url.includes('/trends')) {
         const tags = url.includes('tag_ids=speed') ? ['temperature', 'speed'] : ['temperature']
         return response({ series: tags.map((tag) => ({ tag_id: tag, display_name: tag, data_type: 'numeric', points: [{ minute_utc: '2026-06-11T20:05:00Z', value: 1, missing: false }] })) })
@@ -107,7 +108,10 @@ describe('analysis workflow', () => {
     }))
     render(<SegmentDetail segment={segment} clickedUtc="2026-06-11T20:05:00Z" analysisId={1} machineId={1} version={version} zone="UTC" onClose={() => {}} />, { wrapper })
     await waitFor(() => expect(requested.some((url) => url.includes('lookback_minutes=15'))).toBe(true))
-    await userEvent.selectOptions(await screen.findByLabelText('Add Variable'), 'speed')
+    const addVariable = await screen.findByRole('combobox', { name: 'Add Variable' })
+    await userEvent.click(addVariable)
+    await userEvent.type(addVariable, 'speed')
+    await userEvent.click(await screen.findByRole('option', { name: /Speed/ }))
     await waitFor(() => expect(requested.some((url) => url.includes('tag_ids=speed'))).toBe(true))
     await userEvent.click(screen.getByLabelText(/Bad/))
     await userEvent.click(screen.getByRole('button', { name: 'Save segment label' }))
@@ -118,12 +122,31 @@ describe('analysis workflow', () => {
     vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
       const url = String(input)
       if (url.includes('/classifications')) return response([{ id: 2, name: 'Active category', active: true }])
-      if (url.includes('/tags')) return response([])
+      if (url.includes('/tags')) return response({ items: [], limit: 25, offset: 0, has_more: false })
       if (url.includes('/trends')) return response({ series: [] })
+      if (url.includes('/minutes/')) return response({ conditions: {}, active_condition_ids: [], missing_tag_ids: [], groups: {}, root_expression_result: false, training_eligible: false })
       return response({})
     }))
     render(<SegmentDetail segment={segment} clickedUtc="2026-06-11T20:05:00Z" analysisId={1} machineId={1} version={version} zone="UTC" onClose={() => {}} />, { wrapper })
     expect(await screen.findByRole('option', { name: 'Active category' })).toBeInTheDocument()
     expect(screen.queryByRole('option', { name: 'Retired category' })).not.toBeInTheDocument()
+  })
+
+  it('resets unsaved annotation fields when switching directly between segments', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/classifications')) return response([{ id: 4, name: 'Normal Production', active: true }])
+      if (url.includes('/trends')) return response({ series: [] })
+      if (url.includes('/minutes/')) return response({ conditions: {}, active_condition_ids: [], missing_tag_ids: [], groups: {}, root_expression_result: false, training_eligible: true })
+      return response({ items: [], limit: 25, offset: 0, has_more: false })
+    }))
+    const second: Segment = { ...segment, id: 8, quality_label: 'GOOD', classification_id: 4, classification_name: 'Normal Production', note: 'Persisted B note' }
+    const view = render(<SegmentDetail segment={segment} clickedUtc="2026-06-11T20:05:00Z" analysisId={1} machineId={1} version={version} zone="UTC" onClose={() => {}} />, { wrapper })
+    await userEvent.click(screen.getByLabelText(/Bad/))
+    await userEvent.type(screen.getByLabelText('Notes'), 'Unsaved A note')
+    view.rerender(<SegmentDetail segment={second} clickedUtc="2026-06-11T20:15:00Z" analysisId={1} machineId={1} version={version} zone="UTC" onClose={() => {}} />)
+    await waitFor(() => expect(screen.getByLabelText(/Good/)).toBeChecked())
+    expect(screen.getByLabelText('Notes')).toHaveValue('Persisted B note')
+    expect(screen.getByLabelText(/Bad/)).not.toBeChecked()
   })
 })

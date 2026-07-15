@@ -1,4 +1,4 @@
-.PHONY: setup migrate seed backend worker live-worker frontend lint typecheck test test-backend test-frontend e2e build checks
+.PHONY: setup migrate seed backend worker live-worker frontend lint typecheck test test-backend test-frontend e2e e2e-real build checks source-smoke
 
 setup:
 	python3 -m venv .venv
@@ -43,8 +43,13 @@ test: test-backend test-frontend
 e2e:
 	cd frontend && npm run e2e
 
+e2e-real:
+	cd frontend && npm run e2e:real
+
+source-smoke:
+	.venv/bin/python -m recipecontrol.source_smoke health
+
 build:
 	cd frontend && npm run build
 
 checks: lint typecheck test build e2e
-

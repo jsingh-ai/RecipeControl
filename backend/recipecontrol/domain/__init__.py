@@ -5,6 +5,7 @@ from recipecontrol.domain.models import (
     DataType,
     Group,
     LogicOperator,
+    MinuteEvaluation,
     RuleDefinition,
 )
 
@@ -14,6 +15,7 @@ __all__ = [
     "DataType",
     "Group",
     "LogicOperator",
+    "MinuteEvaluation",
     "RuleDefinition",
     "segment_timeline",
 ]

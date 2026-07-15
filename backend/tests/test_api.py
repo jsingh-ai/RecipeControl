@@ -1,9 +1,10 @@
-from datetime import UTC, timedelta
+from datetime import UTC, datetime, timedelta
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
-from recipecontrol.database import SessionLocal
+from recipecontrol.database import SessionLocal, utc_now
 from recipecontrol.live_worker import process_live_once
 from recipecontrol.models import (
     AnalysisJobModel,
@@ -11,7 +12,9 @@ from recipecontrol.models import (
     ClassificationModel,
     SegmentModel,
 )
-from recipecontrol.worker import process_job, run_once
+from recipecontrol.source.base import Machine, Tag, TagPage
+from recipecontrol.source.fixture import FixtureSourceDataRepository
+from recipecontrol.worker import process_job, recover_stale_jobs, run_once
 
 
 def saved_rule(client: TestClient) -> tuple[int, int]:
@@ -61,6 +64,109 @@ def create_analysis(client: TestClient, machine_id: int, version_id: int, **extr
         **extra,
     }
     return client.post("/api/analyses", json=payload)
+
+
+class MutableMetadataSource(FixtureSourceDataRepository):
+    def __init__(self) -> None:
+        self.tags = {
+            "temperature": Tag(
+                "temperature", "m1", "Authoritative Temperature", "Double", "numeric"
+            ),
+            "other": Tag("other", "m2", "Other Machine Tag", "Double", "numeric"),
+            "disabled": Tag("disabled", "m1", "Disabled Tag", "Double", "numeric"),
+        }
+
+    def list_machines(self):
+        return (Machine("m1", "Machine One"), Machine("m2", "Machine Two"))
+
+    def search_tags(self, machine_key: str, query: str = "", *, limit: int = 50, offset: int = 0):
+        matches = tuple(
+            tag
+            for key, tag in self.tags.items()
+            if key != "disabled"
+            and tag.machine_key == machine_key
+            and query.casefold() in tag.display_name.casefold()
+        )
+        return TagPage(
+            matches[offset : offset + limit], limit, offset, len(matches) > offset + limit
+        )
+
+    def resolve_tags(self, machine_key: str, tag_keys, *, include_disabled: bool = False):
+        return tuple(
+            tag
+            for key in tag_keys
+            if (tag := self.tags.get(key)) is not None
+            and tag.machine_key == machine_key
+            and (include_disabled or key != "disabled")
+        )
+
+
+def test_rule_save_uses_authoritative_tag_metadata_and_keeps_locked_snapshot(
+    client: TestClient, monkeypatch
+) -> None:
+    source = MutableMetadataSource()
+    monkeypatch.setattr("recipecontrol.api.get_source_repository", lambda: source)
+    machine = client.get("/api/machines").json()[0]
+    created = client.post(
+        "/api/rule-sets", json={"machine_id": machine["id"], "name": "Trusted metadata"}
+    ).json()
+    version_id = created["version"]["id"]
+    payload = {
+        "root_operator": "OR",
+        "groups": [
+            {
+                "internal_operator": "OR",
+                "conditions": [
+                    {
+                        "tag_id": "temperature",
+                        "source_display_name": "Spoofed",
+                        "source_data_type": "text",
+                        "operator": "ABOVE_MAXIMUM",
+                        "maximum": "250",
+                    }
+                ],
+            }
+        ],
+    }
+    saved = client.put(f"/api/rule-versions/{version_id}", json=payload)
+    assert saved.status_code == 200
+    condition = saved.json()["groups"][0]["conditions"][0]
+    assert condition["source_display_name"] == "Authoritative Temperature"
+    assert condition["source_raw_data_type"] == "Double"
+    assert condition["source_data_type"] == "numeric"
+    assert client.post(f"/api/rule-versions/{version_id}/lock").status_code == 200
+    source.tags["temperature"] = Tag("temperature", "m1", "Renamed Later", "Float", "numeric")
+    locked = client.get(f"/api/rule-versions/{version_id}").json()
+    assert locked["groups"][0]["conditions"][0]["source_display_name"] == (
+        "Authoritative Temperature"
+    )
+
+
+@pytest.mark.parametrize("tag_id", ["other", "missing", "disabled"])
+def test_invalid_cross_machine_nonexistent_and_disabled_tags_are_rejected(
+    client: TestClient, monkeypatch, tag_id: str
+) -> None:
+    source = MutableMetadataSource()
+    monkeypatch.setattr("recipecontrol.api.get_source_repository", lambda: source)
+    machine = client.get("/api/machines").json()[0]
+    version_id = client.post(
+        "/api/rule-sets", json={"machine_id": machine["id"], "name": f"Invalid {tag_id}"}
+    ).json()["version"]["id"]
+    response = client.put(
+        f"/api/rule-versions/{version_id}",
+        json={
+            "root_operator": "OR",
+            "groups": [
+                {
+                    "internal_operator": "OR",
+                    "conditions": [
+                        {"tag_id": tag_id, "operator": "EQUALS", "comparison_value": "x"}
+                    ],
+                }
+            ],
+        },
+    )
+    assert response.status_code == 422
 
 
 def test_one_condition_is_enough_and_locked_version_is_immutable(client: TestClient) -> None:
@@ -195,6 +301,7 @@ def test_failed_job_has_no_partial_output(client: TestClient, monkeypatch) -> No
         )
         assert job is not None
         job.state = "RUNNING"
+        job.attempt_count = 3
         session.commit()
         job_id = job.id
 
@@ -213,6 +320,45 @@ def test_failed_job_has_no_partial_output(client: TestClient, monkeypatch) -> No
             )
             == 0
         )
+
+
+def test_stale_job_is_reclaimed_then_fails_at_retry_limit(client: TestClient) -> None:
+    machine_id, version_id = saved_rule(client)
+    analysis_id = create_analysis(client, machine_id, version_id).json()["id"]
+    with SessionLocal() as session:
+        job = session.scalar(
+            select(AnalysisJobModel).where(AnalysisJobModel.analysis_id == analysis_id)
+        )
+        assert job is not None
+        job.state = "RUNNING"
+        job.attempt_count = 1
+        job.heartbeat_at = utc_now() - timedelta(hours=1)
+        session.commit()
+        assert recover_stale_jobs(session) == 1
+        assert job.state == "QUEUED"
+        job.state = "RUNNING"
+        job.attempt_count = 3
+        job.heartbeat_at = utc_now() - timedelta(hours=1)
+        session.commit()
+        assert recover_stale_jobs(session) == 1
+        assert job.state == "FAILED"
+        assert session.get(AnalysisModel, analysis_id).error_message == (
+            "Analysis worker stopped before completion. Retry limit reached."
+        )
+
+
+def test_exact_minute_endpoint_returns_interior_values(client: TestClient) -> None:
+    machine_id, version_id = saved_rule(client)
+    analysis_id = create_analysis(client, machine_id, version_id).json()["id"]
+    assert run_once("minute-worker")
+    clicked = datetime(2026, 6, 11, 20, 10, tzinfo=UTC)
+    body = client.get(f"/api/analyses/{analysis_id}/minutes/{clicked.isoformat()}").json()
+    expected_speed = str(int(clicked.timestamp() // 60) % 60 * 5)
+    speed = next(item for item in body["conditions"].values() if item["tag_id"] == "speed")
+    assert body["minute_utc"].startswith("2026-06-11T20:10")
+    assert speed["value"] == expected_speed
+    assert "pending_progress" in speed
+    assert "root_expression_result" in body
 
 
 def test_source_repository_exposes_no_write_operation() -> None:

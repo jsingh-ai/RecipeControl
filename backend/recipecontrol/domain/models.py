@@ -123,6 +123,16 @@ class BoundaryEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class MinuteEvaluation:
+    minute_utc: datetime
+    segment_identity: str
+    system_state: SystemState
+    active_condition_ids: tuple[int, ...]
+    missing_tag_ids: tuple[str, ...]
+    snapshot: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class SegmentationResult:
     start_utc: datetime
     end_utc: datetime
@@ -130,3 +140,4 @@ class SegmentationResult:
     segments: tuple[Segment, ...]
     condition_intervals: tuple[ConditionInterval, ...]
     boundaries: tuple[BoundaryEvent, ...]
+    minute_evaluations: tuple[MinuteEvaluation, ...] = ()
