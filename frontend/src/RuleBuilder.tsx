@@ -1,0 +1,206 @@
+import { zodResolver } from '@hookform/resolvers/zod'
+import { useMutation, useQuery } from '@tanstack/react-query'
+import { useEffect, useState } from 'react'
+import { useFieldArray, useForm } from 'react-hook-form'
+import { z } from 'zod'
+import { api, Machine, RuleVersion, Tag } from './api'
+
+const conditionSchema = z.object({
+  source_tag_key: z.string().min(1, 'Choose a variable'),
+  source_display_name: z.string().min(1),
+  source_data_type: z.enum(['numeric', 'text', 'boolean']),
+  operator: z.string().min(1, 'Choose an operator'),
+  minimum: z.string().optional(),
+  maximum: z.string().optional(),
+  comparison_value: z.union([z.string(), z.boolean()]).optional(),
+  delta_amount: z.string().optional(),
+  delta_window_minutes: z.coerce.number().int().min(1).optional(),
+  duration_minutes: z.coerce.number().int().min(0),
+}).superRefine((condition, context) => {
+  if (condition.operator === 'OUTSIDE_RANGE') {
+    if (!condition.minimum || !condition.maximum) context.addIssue({ code: 'custom', message: 'Both range bounds are required' })
+    else if (Number(condition.minimum) > Number(condition.maximum)) context.addIssue({ code: 'custom', message: 'Minimum cannot exceed maximum' })
+  }
+  if (condition.operator === 'BELOW_MINIMUM' && !condition.minimum) context.addIssue({ code: 'custom', message: 'Minimum is required' })
+  if (condition.operator === 'ABOVE_MAXIMUM' && !condition.maximum) context.addIssue({ code: 'custom', message: 'Maximum is required' })
+  if (['EQUALS', 'NOT_EQUALS'].includes(condition.operator) && condition.comparison_value === undefined) context.addIssue({ code: 'custom', message: 'Comparison value is required' })
+  if (['INCREASE_BY', 'DECREASE_BY'].includes(condition.operator) && (!condition.delta_amount || Number(condition.delta_amount) <= 0)) context.addIssue({ code: 'custom', message: 'Delta amount must be positive' })
+})
+
+export const ruleFormSchema = z.object({
+  root_operator: z.enum(['AND', 'OR']),
+  groups: z.array(z.object({
+    internal_operator: z.enum(['AND', 'OR']),
+    conditions: z.array(conditionSchema).min(1, 'A group needs one condition'),
+  })).min(1, 'Add at least one group'),
+})
+
+export type RuleForm = z.infer<typeof ruleFormSchema>
+
+export function operatorsFor(dataType: Tag['data_type']): string[] {
+  if (dataType === 'numeric') return ['BELOW_MINIMUM', 'ABOVE_MAXIMUM', 'OUTSIDE_RANGE', 'EQUALS', 'NOT_EQUALS', 'INCREASE_BY', 'DECREASE_BY']
+  return ['EQUALS', 'NOT_EQUALS']
+}
+
+export function serializeRule(values: RuleForm): RuleForm {
+  return ruleFormSchema.parse(values)
+}
+
+const blankCondition = (): RuleForm['groups'][number]['conditions'][number] => ({
+  source_tag_key: '', source_display_name: '', source_data_type: 'numeric', operator: 'ABOVE_MAXIMUM',
+  maximum: '', duration_minutes: 0,
+})
+
+export default function RuleBuilder() {
+  const [machineId, setMachineId] = useState<number | ''>('')
+  const [name, setName] = useState('')
+  const [version, setVersion] = useState<RuleVersion | null>(null)
+  const [notice, setNotice] = useState('')
+  const machines = useQuery({ queryKey: ['machines'], queryFn: () => api<Machine[]>('/machines') })
+  const tags = useQuery({
+    queryKey: ['tags', machineId],
+    queryFn: () => api<Tag[]>(`/machines/${machineId}/tags`),
+    enabled: Boolean(machineId),
+  })
+  const form = useForm<RuleForm>({
+    resolver: zodResolver(ruleFormSchema),
+    defaultValues: { root_operator: 'OR', groups: [{ internal_operator: 'AND', conditions: [blankCondition()] }] },
+  })
+  const groups = useFieldArray({ control: form.control, name: 'groups' })
+  const watched = form.watch()
+
+  useEffect(() => {
+    if (version) form.reset({
+      root_operator: version.root_operator,
+      groups: version.groups.length ? version.groups.map((group) => ({
+        internal_operator: group.internal_operator,
+        conditions: group.conditions.map((item) => ({
+          source_tag_key: item.source_tag_key,
+          source_display_name: item.source_display_name,
+          source_data_type: item.source_data_type,
+          operator: item.operator,
+          minimum: item.minimum ?? undefined,
+          maximum: item.maximum ?? undefined,
+          comparison_value: typeof item.comparison_value === 'boolean' || typeof item.comparison_value === 'string' ? item.comparison_value : undefined,
+          delta_amount: item.delta_amount ?? undefined,
+          delta_window_minutes: item.delta_window_minutes ?? undefined,
+          duration_minutes: item.duration_minutes,
+        })),
+      })) : [{ internal_operator: 'AND', conditions: [blankCondition()] }],
+    })
+  }, [version, form])
+
+  const create = useMutation({
+    mutationFn: () => api<{ rule_set_id: number; version: RuleVersion }>('/rule-sets', {
+      method: 'POST', body: JSON.stringify({ machine_id: machineId, name }),
+    }),
+    onSuccess: (data) => { setVersion(data.version); setNotice('Draft created. Add conditions, then save and lock it.') },
+  })
+  const save = useMutation({
+    mutationFn: async (values: RuleForm) => {
+      if (!version) throw new Error('Create a draft first')
+      await api(`/rule-versions/${version.id}`, { method: 'PUT', body: JSON.stringify(serializeRule(values)) })
+      return api<RuleVersion>(`/rule-versions/${version.id}/lock`, { method: 'POST' })
+    },
+    onSuccess: (saved) => { setVersion(saved); setNotice(`Version ${saved.version_number} saved and locked.`) },
+  })
+  const newVersion = useMutation({
+    mutationFn: () => api<RuleVersion>(`/rule-sets/${version!.rule_set_id}/versions`, { method: 'POST' }),
+    onSuccess: (created) => { setVersion(created); form.reset({ root_operator: 'OR', groups: [{ internal_operator: 'AND', conditions: [blankCondition()] }] }); setNotice('New blank version created.') },
+  })
+
+  function addCondition(groupIndex: number) {
+    const current = form.getValues(`groups.${groupIndex}.conditions`)
+    form.setValue(`groups.${groupIndex}.conditions`, [...current, blankCondition()], { shouldDirty: true })
+  }
+
+  function removeCondition(groupIndex: number, conditionIndex: number) {
+    const current = form.getValues(`groups.${groupIndex}.conditions`)
+    form.setValue(`groups.${groupIndex}.conditions`, current.filter((_, index) => index !== conditionIndex), { shouldValidate: true })
+  }
+
+  const preview = watched.groups?.map((group) => `(${group.conditions.map((item) => `${item.source_display_name || 'Variable'} ${item.operator.replaceAll('_', ' ').toLowerCase()}`).join(` ${group.internal_operator} `)})`).join(` ${watched.root_operator} `)
+
+  return <main className="mx-auto max-w-7xl space-y-5 p-6" aria-label="Rule builder">
+    <header>
+      <p className="text-sm uppercase tracking-[0.3em] text-cyan-400">Definition studio</p>
+      <h1 className="text-3xl font-bold">Build a break definition</h1>
+      <p className="mt-2 text-slate-400">Saved versions are immutable and belong to one machine.</p>
+    </header>
+
+    <section className="panel grid gap-4 md:grid-cols-[1fr_2fr_auto]">
+      <label>Machine
+        <select aria-label="Machine" value={machineId} onChange={(event) => setMachineId(Number(event.target.value) || '')} disabled={Boolean(version)}>
+          <option value="">Choose machine</option>
+          {machines.data?.map((machine) => <option key={machine.id} value={machine.id}>{machine.name}</option>)}
+        </select>
+      </label>
+      <label>Definition name
+        <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Example: Production break rules" disabled={Boolean(version)} />
+      </label>
+      {!version ? <button className="button-primary self-end" disabled={!machineId || !name.trim() || create.isPending} onClick={() => create.mutate()}>Create Draft</button>
+        : <div className="self-end"><span className="badge bg-slate-700">v{version.version_number} · {version.status}</span></div>}
+    </section>
+
+    {version && <form className="space-y-4" onSubmit={form.handleSubmit((values) => save.mutate(values))}>
+      <section className="panel flex flex-wrap items-end gap-4">
+        <label>Root operator between groups
+          <select aria-label="Root operator" {...form.register('root_operator')} disabled={version.status === 'LOCKED'}><option>OR</option><option>AND</option></select>
+        </label>
+        <div className="min-w-64 flex-1 rounded-lg bg-slate-950 p-3 text-sm text-slate-300"><strong>Expression:</strong> {preview}</div>
+      </section>
+
+      {groups.fields.map((field, groupIndex) => <section className="panel space-y-4" key={field.id}>
+        <div className="flex items-center justify-between gap-3">
+          <h2 className="text-lg font-semibold">Group {groupIndex + 1}</h2>
+          <div className="flex gap-2">
+            <select aria-label={`Group ${groupIndex + 1} operator`} {...form.register(`groups.${groupIndex}.internal_operator`)} disabled={version.status === 'LOCKED'}><option>AND</option><option>OR</option></select>
+            <button type="button" className="button-secondary" disabled={version.status === 'LOCKED'} onClick={() => groups.move(groupIndex, Math.max(0, groupIndex - 1))}>Move up</button>
+            <button type="button" className="button-secondary" disabled={version.status === 'LOCKED'} onClick={() => groups.remove(groupIndex)}>Remove Group</button>
+          </div>
+        </div>
+        {watched.groups?.[groupIndex]?.conditions.map((condition, conditionIndex) => {
+          const type = condition.source_data_type
+          const operator = condition.operator
+          return <div className="grid gap-3 rounded-xl border border-slate-700 p-4 lg:grid-cols-6" key={`${groupIndex}-${conditionIndex}`} data-testid="condition-row">
+            <label className="lg:col-span-2">Variable
+              <select aria-label={`Variable ${conditionIndex + 1}`} value={condition.source_tag_key} disabled={version.status === 'LOCKED'} onChange={(event) => {
+                const selected = tags.data?.find((tag) => tag.key === event.target.value)
+                if (!selected) return
+                form.setValue(`groups.${groupIndex}.conditions.${conditionIndex}.source_tag_key`, selected.key)
+                form.setValue(`groups.${groupIndex}.conditions.${conditionIndex}.source_display_name`, selected.display_name)
+                form.setValue(`groups.${groupIndex}.conditions.${conditionIndex}.source_data_type`, selected.data_type)
+                form.setValue(`groups.${groupIndex}.conditions.${conditionIndex}.operator`, operatorsFor(selected.data_type)[0])
+              }}>
+                <option value="">Search/select variable</option>
+                {tags.data?.map((tag) => <option key={tag.key} value={tag.key}>{tag.display_name} · {tag.key} · {tag.data_type}</option>)}
+              </select>
+            </label>
+            <label>Operator
+              <select aria-label={`Operator ${conditionIndex + 1}`} {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.operator`)} disabled={version.status === 'LOCKED'}>
+                {operatorsFor(type).map((item) => <option key={item} value={item}>{item.replaceAll('_', ' ')}</option>)}
+              </select>
+            </label>
+            {operator === 'BELOW_MINIMUM' && <label>Minimum<input type="number" step="any" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.minimum`)} /></label>}
+            {operator === 'ABOVE_MAXIMUM' && <label>Maximum<input type="number" step="any" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.maximum`)} /></label>}
+            {operator === 'OUTSIDE_RANGE' && <><label>Minimum<input type="number" step="any" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.minimum`)} /></label><label>Maximum<input type="number" step="any" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.maximum`)} /></label></>}
+            {['EQUALS', 'NOT_EQUALS'].includes(operator) && <label>Comparison
+              {type === 'boolean' ? <select {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.comparison_value`)}><option value="true">true</option><option value="false">false</option></select> : <input type={type === 'numeric' ? 'number' : 'text'} step="any" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.comparison_value`)} />}
+            </label>}
+            {['INCREASE_BY', 'DECREASE_BY'].includes(operator) && <><label>Delta amount<input type="number" min="0" step="any" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.delta_amount`)} /></label><label>Window minutes<input type="number" min="1" step="1" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.delta_window_minutes`)} /></label></>}
+            <label>Activation minutes<input type="number" min="0" step="1" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.duration_minutes`)} disabled={version.status === 'LOCKED'} /></label>
+            <button type="button" className="button-secondary self-end" disabled={version.status === 'LOCKED'} onClick={() => removeCondition(groupIndex, conditionIndex)}>Remove</button>
+          </div>
+        })}
+        <button type="button" className="button-secondary" disabled={version.status === 'LOCKED'} onClick={() => addCondition(groupIndex)}>Add Condition</button>
+      </section>)}
+
+      <div className="flex gap-3">
+        {version.status === 'DRAFT' && <><button type="button" className="button-secondary" onClick={() => groups.append({ internal_operator: 'AND', conditions: [blankCondition()] })}>Add Group</button><button className="button-primary" type="submit" disabled={save.isPending}>Save & Lock Version</button></>}
+        {version.status === 'LOCKED' && <button type="button" className="button-primary" onClick={() => newVersion.mutate()}>Create New Blank Version</button>}
+      </div>
+      {Object.keys(form.formState.errors).length > 0 && <p role="alert" className="text-red-300">Fix the highlighted rule fields. Every saved group needs a valid condition.</p>}
+    </form>}
+    {(notice || create.error || save.error) && <p role="status" className="panel">{notice || create.error?.message || save.error?.message}</p>}
+  </main>
+}
