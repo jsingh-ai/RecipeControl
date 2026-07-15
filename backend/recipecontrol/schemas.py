@@ -73,6 +73,14 @@ class RuleSetCreate(BaseModel):
     machine_id: int
     name: str = Field(min_length=1, max_length=200)
 
+    @field_validator("name")
+    @classmethod
+    def strip_name(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("Rule-set name cannot be blank")
+        return stripped
+
 
 class ClassificationCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
@@ -80,7 +88,10 @@ class ClassificationCreate(BaseModel):
     @field_validator("name")
     @classmethod
     def strip_name(cls, value: str) -> str:
-        return value.strip()
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("Classification name cannot be blank")
+        return stripped
 
 
 class AnalysisCreate(BaseModel):
@@ -90,6 +101,16 @@ class AnalysisCreate(BaseModel):
     selected_end_utc: datetime
     title: str | None = Field(default=None, max_length=200)
     create_duplicate: bool = False
+
+    @field_validator("title")
+    @classmethod
+    def strip_title(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("Analysis title cannot be blank")
+        return stripped
 
     @field_validator("selected_start_utc", "selected_end_utc")
     @classmethod

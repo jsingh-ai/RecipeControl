@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import pytest
 from fastapi.testclient import TestClient
@@ -12,9 +13,9 @@ from recipecontrol.models import (
     ClassificationModel,
     SegmentModel,
 )
-from recipecontrol.source.base import Machine, Tag, TagPage
+from recipecontrol.source.base import Machine, Sample, Tag, TagPage
 from recipecontrol.source.fixture import FixtureSourceDataRepository
-from recipecontrol.worker import process_job, recover_stale_jobs, run_once
+from recipecontrol.worker import claim_one, process_job, recover_stale_jobs, run_once
 
 
 def saved_rule(client: TestClient) -> tuple[int, int]:
@@ -99,6 +100,17 @@ class MutableMetadataSource(FixtureSourceDataRepository):
             and tag.machine_key == machine_key
             and (include_disabled or key != "disabled")
         )
+
+    def get_samples(self, machine_key, tag_kinds, start_utc, end_utc):
+        if machine_key != "m1":
+            return
+        row_id = 1
+        minute = start_utc
+        while minute < end_utc:
+            for key in tag_kinds:
+                yield Sample(key, minute + timedelta(seconds=5), Decimal("260"), row_id)
+                row_id += 1
+            minute += timedelta(minutes=1)
 
 
 def test_rule_save_uses_authoritative_tag_metadata_and_keeps_locked_snapshot(
@@ -198,6 +210,42 @@ def test_one_condition_is_enough_and_locked_version_is_immutable(client: TestCli
     assert client.put(f"/api/rule-versions/{version_id}", json=payload).status_code == 422
 
 
+def test_same_source_tag_can_be_used_by_distinct_conditions(client: TestClient) -> None:
+    machine = client.get("/api/machines").json()[0]
+    version_id = client.post(
+        "/api/rule-sets", json={"machine_id": machine["id"], "name": "Repeated temperature"}
+    ).json()["version"]["id"]
+    response = client.put(
+        f"/api/rule-versions/{version_id}",
+        json={
+            "root_operator": "OR",
+            "groups": [
+                {
+                    "internal_operator": "OR",
+                    "conditions": [
+                        {
+                            "tag_id": "temperature",
+                            "operator": "ABOVE_MAXIMUM",
+                            "maximum": "250",
+                            "duration_minutes": 5,
+                        },
+                        {
+                            "tag_id": "temperature",
+                            "operator": "INCREASE_BY",
+                            "delta_amount": "5",
+                            "delta_window_minutes": 10,
+                        },
+                    ],
+                }
+            ],
+        },
+    )
+    assert response.status_code == 200
+    conditions = response.json()["groups"][0]["conditions"]
+    assert [item["source_tag_key"] for item in conditions] == ["temperature", "temperature"]
+    assert conditions[0]["id"] != conditions[1]["id"]
+
+
 def test_new_version_is_completely_blank(client: TestClient) -> None:
     _, version_id = saved_rule(client)
     version = client.get(f"/api/rule-versions/{version_id}").json()
@@ -230,6 +278,34 @@ def test_duplicate_conflict_and_explicit_creation(client: TestClient) -> None:
     assert duplicate.json()["duplicate_of_analysis_id"] == first.json()["id"]
 
 
+def test_duplicate_results_prefer_newest_complete_analysis(client: TestClient) -> None:
+    machine_id, version_id = saved_rule(client)
+    failed_id = create_analysis(client, machine_id, version_id).json()["id"]
+    older_complete_id = create_analysis(
+        client, machine_id, version_id, create_duplicate=True
+    ).json()["id"]
+    newest_complete_id = create_analysis(
+        client, machine_id, version_id, create_duplicate=True
+    ).json()["id"]
+    with SessionLocal() as session:
+        failed = session.get(AnalysisModel, failed_id)
+        older = session.get(AnalysisModel, older_complete_id)
+        newest = session.get(AnalysisModel, newest_complete_id)
+        assert failed and older and newest
+        failed.status = "FAILED"
+        older.status = "COMPLETE"
+        older.completed_at = utc_now() - timedelta(minutes=2)
+        newest.status = "COMPLETE"
+        newest.completed_at = utc_now() - timedelta(minutes=1)
+        session.commit()
+    conflict = create_analysis(client, machine_id, version_id).json()
+    assert [item["id"] for item in conflict["matches"]] == [
+        newest_complete_id,
+        older_complete_id,
+        failed_id,
+    ]
+
+
 def test_worker_timeline_label_classification_and_snapshot(client: TestClient) -> None:
     machine_id, version_id = saved_rule(client)
     analysis_id = create_analysis(client, machine_id, version_id).json()["id"]
@@ -245,7 +321,7 @@ def test_worker_timeline_label_classification_and_snapshot(client: TestClient) -
     ).json()
     segment = next(item for item in timeline["segments"] if item["system_state"] == "BREAK")
     updated = client.patch(
-        f"/api/segments/{segment['id']}",
+        f"/api/analyses/{analysis_id}/segments/{segment['id']}",
         json={
             "quality_label": "BAD",
             "classification_id": classification["id"],
@@ -271,7 +347,8 @@ def test_system_segments_can_be_labeled_but_are_not_training_eligible(client: Te
         if item["system_state"] in {"DATA_GAP", "INSUFFICIENT_HISTORY"}
     )
     updated = client.patch(
-        f"/api/segments/{system_segment['id']}", json={"quality_label": "GOOD", "note": "known"}
+        f"/api/analyses/{analysis_id}/segments/{system_segment['id']}",
+        json={"quality_label": "GOOD", "note": "known"},
     ).json()
     assert updated["quality_label"] == "GOOD"
     assert updated["training_eligible"] is False
@@ -290,6 +367,90 @@ def test_trend_defaults_to_condition_tags_and_fifteen_minutes(client: TestClient
     assert body["lookback_minutes"] == 15
     assert {series["tag_id"] for series in body["series"]} == {"temperature", "speed"}
     assert all(len(series["points"]) == 15 for series in body["series"])
+
+
+def test_analysis_scoped_annotation_rejects_segment_from_another_analysis(
+    client: TestClient,
+) -> None:
+    machine_id, version_id = saved_rule(client)
+    first = create_analysis(client, machine_id, version_id).json()["id"]
+    second = create_analysis(client, machine_id, version_id, create_duplicate=True).json()["id"]
+    assert run_once("first-analysis")
+    assert run_once("second-analysis")
+    segment = client.get(f"/api/analyses/{first}/timeline").json()["segments"][0]
+    response = client.patch(
+        f"/api/analyses/{second}/segments/{segment['id']}",
+        json={"quality_label": "BAD"},
+    )
+    assert response.status_code == 409
+    assert client.get(f"/api/segments/{segment['id']}").json()["quality_label"] is None
+
+
+def test_archived_definition_analysis_remains_inspectable_and_annotatable(
+    client: TestClient,
+) -> None:
+    machine_id, version_id = saved_rule(client)
+    analysis_id = create_analysis(client, machine_id, version_id).json()["id"]
+    assert run_once("archive-worker")
+    version = client.get(f"/api/rule-versions/{version_id}").json()
+    assert client.post(f"/api/rule-sets/{version['rule_set_id']}/archive").status_code == 200
+    assert client.get(f"/api/rule-versions/{version_id}").status_code == 200
+    timeline = client.get(f"/api/analyses/{analysis_id}/timeline")
+    assert timeline.status_code == 200 and timeline.json()["conditions"]
+    segment = timeline.json()["segments"][0]
+    updated = client.patch(
+        f"/api/analyses/{analysis_id}/segments/{segment['id']}",
+        json={"quality_label": "UNSURE", "note": "Historical review"},
+    )
+    assert updated.status_code == 200
+    assert (
+        client.get(
+            f"/api/analyses/{analysis_id}/trends", params={"clicked_utc": segment["start_utc"]}
+        ).status_code
+        == 200
+    )
+    assert create_analysis(client, machine_id, version_id, create_duplicate=True).status_code == 422
+    assert client.post(f"/api/rule-sets/{version['rule_set_id']}/versions").status_code == 422
+
+
+def test_default_historical_trend_uses_snapshot_after_source_tag_is_disabled(
+    client: TestClient, monkeypatch
+) -> None:
+    source = MutableMetadataSource()
+    monkeypatch.setattr("recipecontrol.api.get_source_repository", lambda: source)
+    monkeypatch.setattr("recipecontrol.worker.get_source_repository", lambda: source)
+    machine = client.get("/api/machines").json()[0]
+    version_id = client.post(
+        "/api/rule-sets", json={"machine_id": machine["id"], "name": "Disabled later"}
+    ).json()["version"]["id"]
+    payload = {
+        "root_operator": "OR",
+        "groups": [
+            {
+                "internal_operator": "OR",
+                "conditions": [
+                    {
+                        "tag_id": "temperature",
+                        "operator": "ABOVE_MAXIMUM",
+                        "maximum": "250",
+                    }
+                ],
+            }
+        ],
+    }
+    assert client.put(f"/api/rule-versions/{version_id}", json=payload).status_code == 200
+    assert client.post(f"/api/rule-versions/{version_id}/lock").status_code == 200
+    analysis_id = create_analysis(client, machine["id"], version_id).json()["id"]
+    assert run_once("disabled-tag-worker")
+    source.tags["disabled"] = source.tags.pop("temperature")
+    response = client.get(
+        f"/api/analyses/{analysis_id}/trends",
+        params={"clicked_utc": "2026-06-11T20:10:00Z"},
+    )
+    assert response.status_code == 200
+    series = response.json()["series"][0]
+    assert series["tag_id"] == "temperature"
+    assert series["display_name"] == "Authoritative Temperature"
 
 
 def test_failed_job_has_no_partial_output(client: TestClient, monkeypatch) -> None:
@@ -347,6 +508,15 @@ def test_stale_job_is_reclaimed_then_fails_at_retry_limit(client: TestClient) ->
         )
 
 
+def test_concurrent_claim_attempt_cannot_claim_one_job_twice(client: TestClient) -> None:
+    machine_id, version_id = saved_rule(client)
+    create_analysis(client, machine_id, version_id)
+    with SessionLocal() as first, SessionLocal() as second:
+        claimed = claim_one(first, "worker-one")
+        assert claimed is not None
+        assert claim_one(second, "worker-two") is None
+
+
 def test_exact_minute_endpoint_returns_interior_values(client: TestClient) -> None:
     machine_id, version_id = saved_rule(client)
     analysis_id = create_analysis(client, machine_id, version_id).json()["id"]
@@ -368,7 +538,22 @@ def test_source_repository_exposes_no_write_operation() -> None:
     assert not any(hasattr(source, name) for name in ("add", "update", "delete", "execute"))
 
 
-def test_live_worker_finalizes_marks_active_repairs_and_stops(client: TestClient) -> None:
+def test_source_diagnostics_aggregate_distinct_raw_types() -> None:
+    from recipecontrol.source.fixture import FixtureSourceDataRepository
+
+    diagnostics = FixtureSourceDataRepository().diagnostics()
+    rows = diagnostics["data_types"]
+    assert len([row for row in rows if row["raw_data_type"] == "Double"]) == 1
+    assert next(row for row in rows if row["raw_data_type"] == "Double")["count"] == 3
+
+
+def test_live_worker_finalizes_marks_active_repairs_and_stops(
+    client: TestClient, monkeypatch
+) -> None:
+    from recipecontrol.config import get_settings
+
+    enabled = get_settings().model_copy(update={"enable_live_mode": True})
+    monkeypatch.setattr("recipecontrol.api.get_settings", lambda: enabled)
     machine_id, version_id = saved_rule(client)
     created = client.post(
         "/api/live-sessions",
@@ -399,3 +584,52 @@ def test_live_worker_finalizes_marks_active_repairs_and_stops(client: TestClient
     assert process_live_once(start + timedelta(minutes=3)) == 1
     stopped = client.post(f"/api/live-sessions/{live_id}/stop").json()
     assert stopped["state"] == "STOPPED"
+
+
+def test_machine_catalog_disables_removed_and_reenables_returned_source_machine(
+    client: TestClient, monkeypatch
+) -> None:
+    source = MutableMetadataSource()
+    visible = [Machine("m1", "Machine One"), Machine("m2", "Machine Two")]
+    monkeypatch.setattr(source, "list_machines", lambda: tuple(visible))
+    monkeypatch.setattr("recipecontrol.api.get_source_repository", lambda: source)
+    first = client.get("/api/machines").json()
+    machine_two = next(item for item in first if item["source_key"] == "m2")
+    visible[:] = [Machine("m1", "Machine One")]
+    assert {item["source_key"] for item in client.get("/api/machines").json()} == {"m1"}
+    inactive = client.get("/api/machines", params={"include_inactive": "true"}).json()
+    assert next(item for item in inactive if item["id"] == machine_two["id"])["enabled"] is False
+    assert (
+        client.post(
+            "/api/rule-sets", json={"machine_id": machine_two["id"], "name": "Not allowed"}
+        ).status_code
+        == 422
+    )
+    visible.append(Machine("m2", "Machine Two Restored"))
+    restored = client.get("/api/machines").json()
+    assert next(item for item in restored if item["id"] == machine_two["id"])["enabled"] is True
+
+
+def test_blank_names_and_invalid_analysis_range_are_rejected(client: TestClient) -> None:
+    machine = client.get("/api/machines").json()[0]
+    assert (
+        client.post("/api/rule-sets", json={"machine_id": machine["id"], "name": "   "}).status_code
+        == 422
+    )
+    machine_id, version_id = saved_rule(client)
+    assert (
+        client.post(
+            f"/api/rule-versions/{version_id}/classifications", json={"name": "   "}
+        ).status_code
+        == 422
+    )
+    assert (
+        create_analysis(
+            client,
+            machine_id,
+            version_id,
+            selected_start_utc="2026-06-12T00:00:00Z",
+            selected_end_utc="2026-06-11T00:00:00Z",
+        ).status_code
+        == 422
+    )

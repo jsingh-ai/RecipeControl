@@ -3,8 +3,10 @@ import hashlib
 import logging
 import os
 import socket
+import threading
 import time
 from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from datetime import timedelta
 
 from sqlalchemy import delete, insert, select, update
@@ -22,10 +24,38 @@ from recipecontrol.models import (
     SegmentModel,
 )
 from recipecontrol.services import version_to_domain
-from recipecontrol.source import get_source_repository
+from recipecontrol.source import dispose_source_repository, get_source_repository
 from recipecontrol.source.base import Sample
 
 logger = logging.getLogger("recipecontrol.worker")
+
+
+def touch_heartbeat(job_id: int) -> None:
+    with SessionLocal() as heartbeat_session:
+        heartbeat_session.execute(
+            update(AnalysisJobModel)
+            .where(AnalysisJobModel.id == job_id, AnalysisJobModel.state == "RUNNING")
+            .values(heartbeat_at=utc_now())
+        )
+        heartbeat_session.commit()
+
+
+@contextmanager
+def background_heartbeat(job_id: int) -> Iterator[None]:
+    interval = min(10.0, max(1.0, get_settings().stale_job_timeout_seconds / 3))
+    stopped = threading.Event()
+
+    def pulse() -> None:
+        while not stopped.wait(interval):
+            touch_heartbeat(job_id)
+
+    thread = threading.Thread(target=pulse, name=f"analysis-heartbeat-{job_id}", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stopped.set()
+        thread.join(timeout=interval + 1)
 
 
 def recover_stale_jobs(session: Session) -> int:
@@ -70,13 +100,7 @@ def heartbeating_samples(samples: Iterable[Sample], job_id: int) -> Iterator[Sam
     next_heartbeat = time.monotonic() + 10
     for sample in samples:
         if time.monotonic() >= next_heartbeat:
-            with SessionLocal() as heartbeat_session:
-                heartbeat_session.execute(
-                    update(AnalysisJobModel)
-                    .where(AnalysisJobModel.id == job_id, AnalysisJobModel.state == "RUNNING")
-                    .values(heartbeat_at=utc_now())
-                )
-                heartbeat_session.commit()
+            touch_heartbeat(job_id)
             next_heartbeat = time.monotonic() + 10
         yield sample
 
@@ -120,27 +144,29 @@ def process_job(job_id: int) -> None:
         job.heartbeat_at = utc_now()
         session.commit()
         try:
-            definition = version_to_domain(analysis.rule_version)
-            tag_kinds = {
-                condition.tag_key: condition.data_type.value for condition in definition.conditions
-            }
-            start = as_utc(analysis.selected_start_utc)
-            selected_end = as_utc(analysis.selected_end_utc)
-            preload_start = start - timedelta(minutes=definition.preload_minutes)
-            generation_started = time.perf_counter()
-            samples = source.get_samples(
-                analysis.machine.source_key,
-                tag_kinds,
-                preload_start,
-                selected_end + timedelta(minutes=1),
-            )
-            result = segment_timeline(
-                definition, heartbeating_samples(samples, job_id), start, selected_end
-            )
+            with background_heartbeat(job_id):
+                definition = version_to_domain(analysis.rule_version)
+                tag_kinds = {
+                    condition.tag_key: condition.data_type.value
+                    for condition in definition.conditions
+                }
+                start = as_utc(analysis.selected_start_utc)
+                selected_end = as_utc(analysis.selected_end_utc)
+                preload_start = start - timedelta(minutes=definition.preload_minutes)
+                generation_started = time.perf_counter()
+                samples = source.get_samples(
+                    analysis.machine.source_key,
+                    tag_kinds,
+                    preload_start,
+                    selected_end + timedelta(minutes=1),
+                )
+                result = segment_timeline(
+                    definition, heartbeating_samples(samples, job_id), start, selected_end
+                )
+                touch_heartbeat(job_id)
 
-            # End the read transaction before atomically replacing generated output.
-            session.commit()
-            with session.begin():
+                # End the read transaction before atomically replacing generated output.
+                session.commit()
                 session.execute(
                     delete(BoundaryEventModel).where(BoundaryEventModel.analysis_id == analysis.id)
                 )
@@ -188,6 +214,7 @@ def process_job(job_id: int) -> None:
                     if len(minute_rows) == 1000:
                         session.execute(insert(AnalysisMinuteModel), minute_rows)
                         minute_rows.clear()
+                        touch_heartbeat(job_id)
                 if minute_rows:
                     session.execute(insert(AnalysisMinuteModel), minute_rows)
                 for interval in result.condition_intervals:
@@ -227,6 +254,7 @@ def process_job(job_id: int) -> None:
                 job.heartbeat_at = utc_now()
                 job.finished_at = utc_now()
                 job.error_details = None
+                session.commit()
             logger.info(
                 "analysis_complete job_id=%s analysis_id=%s rows=%s segments=%s elapsed_ms=%.2f",
                 job.id,
@@ -276,12 +304,15 @@ def main() -> None:
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    if args.once:
-        run_once()
-        return
-    while True:
-        if not run_once():
-            time.sleep(args.poll_seconds)
+    try:
+        if args.once:
+            run_once()
+            return
+        while True:
+            if not run_once():
+                time.sleep(args.poll_seconds)
+    finally:
+        dispose_source_repository()
 
 
 if __name__ == "__main__":

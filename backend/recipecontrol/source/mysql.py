@@ -1,3 +1,4 @@
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -24,15 +25,59 @@ NUMERIC_OPC_TYPES = frozenset(
         "number",
         "integer",
         "uinteger",
+        "int8",
+        "uint8",
+        "float32",
+        "float64",
+        "short",
+        "ushort",
+        "long",
+        "ulong",
     }
+)
+TEXT_OPC_TYPES = frozenset(
+    {"string", "char", "datetime", "guid", "localizedtext", "xml", "xmlelement", "bytestring"}
+)
+
+MACHINE_SELECT = "SELECT id, machine_name FROM machines WHERE enabled = 1 ORDER BY machine_name"
+TAG_SELECT_PREFIX = (
+    "SELECT t.id, t.machine_id, t.node_id, t.opc_path, t.display_name, t.browse_name, "
+    "t.data_type, EXISTS (SELECT 1 FROM tag_samples observed WHERE observed.tag_id = t.id "
+    "AND observed.machine_id = t.machine_id AND observed.value_numeric IS NOT NULL LIMIT 1) "
+    "AS observed_numeric, EXISTS (SELECT 1 FROM tag_samples observed WHERE observed.tag_id = t.id "
+    "AND observed.machine_id = t.machine_id AND LOWER(TRIM(observed.value_text)) "
+    "IN ('true','false','0','1') LIMIT 1) AS observed_boolean "
+)
+SAMPLE_SELECT = (
+    "SELECT ts.id, ts.tag_id, ts.machine_id, ts.sampled_at_utc, ts.value_numeric, "
+    "ts.value_text, ts.quality, ts.status_code, ts.error_text FROM tag_samples ts "
+    "WHERE ts.machine_id = :machine_id AND ts.tag_id IN :tag_ids "
+    "AND ts.sampled_at_utc >= :start_utc AND ts.sampled_at_utc < :end_utc "
+    "ORDER BY ts.sampled_at_utc, ts.tag_id, ts.id"
 )
 
 
-def normalize_data_kind(raw_data_type: str | None) -> str:
-    normalized = (raw_data_type or "").strip().casefold()
+def _type_leaf(raw_data_type: str | None) -> str:
+    parts = [part for part in re.split(r"[^a-zA-Z0-9]+", raw_data_type or "") if part]
+    return parts[-1].casefold() if parts else ""
+
+
+def normalize_data_kind(
+    raw_data_type: str | None,
+    *,
+    observed_numeric: bool = False,
+    observed_boolean: bool = False,
+) -> str:
+    normalized = _type_leaf(raw_data_type)
     if normalized in NUMERIC_OPC_TYPES:
         return "numeric"
     if normalized == "boolean":
+        return "boolean"
+    if normalized in TEXT_OPC_TYPES:
+        return "text"
+    if observed_numeric:
+        return "numeric"
+    if observed_boolean:
         return "boolean"
     return "text"
 
@@ -107,10 +152,68 @@ class MySQLSourceDataRepository:
             "session_time_zone": str(row.session_time_zone),
         }
 
+    def dispose(self) -> None:
+        self.engine.dispose()
+
+    def diagnostics(self) -> dict[str, object]:
+        with self.engine.connect() as connection:
+            counts = connection.execute(
+                text(
+                    "SELECT (SELECT COUNT(*) FROM machines WHERE enabled = 1) "
+                    "AS machine_count, (SELECT COUNT(*) FROM tags WHERE enabled = 1) AS tag_count"
+                )
+            ).one()
+            types = connection.execute(
+                text(
+                    "SELECT data_type, COUNT(*) AS tag_count FROM tags WHERE enabled = 1 "
+                    "GROUP BY data_type ORDER BY data_type"
+                )
+            )
+            bounds = connection.execute(
+                text(
+                    "SELECT machine_id, MIN(sampled_at_utc) AS minimum_utc, "
+                    "MAX(sampled_at_utc) AS maximum_utc FROM tag_samples GROUP BY machine_id "
+                    "ORDER BY machine_id"
+                )
+            )
+            type_rows = list(types)
+            bound_rows = list(bounds)
+        return {
+            "adapter": "mysql-opcua-collector",
+            "enabled_machine_count": int(counts.machine_count),
+            "enabled_tag_count": int(counts.tag_count),
+            "data_types": [
+                {
+                    "raw_data_type": row.data_type,
+                    "count": int(row.tag_count),
+                    "data_kind": normalize_data_kind(row.data_type),
+                }
+                for row in type_rows
+            ],
+            "sample_bounds": [
+                {
+                    "machine_id": str(row.machine_id),
+                    "minimum_utc": (
+                        row.minimum_utc.replace(tzinfo=UTC).isoformat()
+                        if row.minimum_utc is not None and row.minimum_utc.tzinfo is None
+                        else row.minimum_utc.isoformat()
+                        if row.minimum_utc is not None
+                        else None
+                    ),
+                    "maximum_utc": (
+                        row.maximum_utc.replace(tzinfo=UTC).isoformat()
+                        if row.maximum_utc is not None and row.maximum_utc.tzinfo is None
+                        else row.maximum_utc.isoformat()
+                        if row.maximum_utc is not None
+                        else None
+                    ),
+                }
+                for row in bound_rows
+            ],
+        }
+
     def list_machines(self) -> Sequence[Machine]:
-        statement = text(
-            "SELECT id, machine_name FROM machines WHERE enabled = 1 ORDER BY machine_name"
-        )
+        statement = text(MACHINE_SELECT)
         with self.engine.connect() as connection:
             return tuple(
                 Machine(str(row.id), str(row.machine_name)) for row in connection.execute(statement)
@@ -124,7 +227,11 @@ class MySQLSourceDataRepository:
             machine_key=str(row.machine_id),  # type: ignore[attr-defined]
             display_name=display_name(row.display_name, row.browse_name, row.node_id),  # type: ignore[attr-defined]
             raw_data_type=raw_type,
-            data_kind=normalize_data_kind(raw_type),
+            data_kind=normalize_data_kind(
+                raw_type,
+                observed_numeric=bool(getattr(row, "observed_numeric", False)),
+                observed_boolean=bool(getattr(row, "observed_boolean", False)),
+            ),
             node_id=str(row.node_id),  # type: ignore[attr-defined]
             opc_path=None if row.opc_path is None else str(row.opc_path),  # type: ignore[attr-defined]
         )
@@ -135,13 +242,12 @@ class MySQLSourceDataRepository:
         limit = min(max(limit, 1), 200)
         offset = max(offset, 0)
         statement = text(
-            "SELECT id, machine_id, node_id, opc_path, display_name, browse_name, data_type "
-            "FROM tags WHERE machine_id = :machine_id AND enabled = 1 "
+            TAG_SELECT_PREFIX + "FROM tags t WHERE t.machine_id = :machine_id AND t.enabled = 1 "
             "AND (:query = '' OR LOWER(COALESCE(display_name, '')) LIKE :pattern "
             "OR LOWER(COALESCE(browse_name, '')) LIKE :pattern "
             "OR LOWER(node_id) LIKE :pattern OR LOWER(COALESCE(opc_path, '')) LIKE :pattern) "
             "ORDER BY COALESCE(NULLIF(TRIM(display_name), ''), "
-            "NULLIF(TRIM(browse_name), ''), node_id), id LIMIT :fetch_limit OFFSET :offset"
+            "NULLIF(TRIM(browse_name), ''), node_id), t.id LIMIT :fetch_limit OFFSET :offset"
         )
         params = {
             "machine_id": int(machine_key),
@@ -162,10 +268,10 @@ class MySQLSourceDataRepository:
         if not tag_keys:
             return ()
         statement = text(
-            "SELECT id, machine_id, node_id, opc_path, display_name, browse_name, data_type "
-            "FROM tags WHERE machine_id = :machine_id "
-            + ("" if include_disabled else "AND enabled = 1 ")
-            + "AND id IN :tag_ids ORDER BY id"
+            TAG_SELECT_PREFIX
+            + "FROM tags t WHERE t.machine_id = :machine_id "
+            + ("" if include_disabled else "AND t.enabled = 1 ")
+            + "AND t.id IN :tag_ids ORDER BY t.id"
         ).bindparams(bindparam("tag_ids", expanding=True))
         with self.engine.connect() as connection:
             rows = connection.execute(
@@ -201,14 +307,7 @@ class MySQLSourceDataRepository:
     ) -> Iterable[Sample]:
         if not tag_kinds:
             return
-        statement = text(
-            "SELECT ts.id, ts.tag_id, ts.machine_id, ts.sampled_at_utc, "
-            "ts.value_numeric, ts.value_text, ts.quality, ts.status_code, ts.error_text "
-            "FROM tag_samples ts WHERE ts.machine_id = :machine_id "
-            "AND ts.tag_id IN :tag_ids AND ts.sampled_at_utc >= :start_utc "
-            "AND ts.sampled_at_utc < :end_utc "
-            "ORDER BY ts.sampled_at_utc, ts.tag_id, ts.id"
-        ).bindparams(bindparam("tag_ids", expanding=True))
+        statement = text(SAMPLE_SELECT).bindparams(bindparam("tag_ids", expanding=True))
         params = {
             "machine_id": int(machine_key),
             "tag_ids": [int(key) for key in tag_kinds],

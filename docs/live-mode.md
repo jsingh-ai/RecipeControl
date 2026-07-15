@@ -1,4 +1,10 @@
-# Live shadow mode
+# Live shadow mode (experimental and disabled)
+
+Live mode is feature-flagged off by default with `ENABLE_LIVE_MODE=false` and
+`VITE_ENABLE_LIVE_MODE=false`. Historical analysis is the supported MVP workflow.
+Do not enable live labeling until exact-minute live persistence, stable annotation
+identity across backdated recomputation, late-arrival policy, and repair semantics
+have dedicated MySQL and browser coverage.
 
 Live sessions are read-only with respect to the collector and reuse the historical segmentation engine. The live worker finalizes through `current UTC minute - finalization lag`; the default lag is two minutes. Finalized minutes are processed in order, the newest segment is marked active, and the UI polls for timeline and heartbeat updates. Pausing auto-follow affects only viewport behavior.
 

@@ -1,23 +1,32 @@
 import { useInfiniteQuery } from '@tanstack/react-query'
-import { KeyboardEvent, useEffect, useId, useMemo, useState } from 'react'
+import { KeyboardEvent, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { api, Tag, TagPage } from './api'
 
 type Props = {
   machineId: number
   value?: Tag | null
   onSelect: (tag: Tag) => void
+  onClear?: () => void
   disabled?: boolean
   label: string
   exclude?: string[]
 }
 
-export default function TagSearch({ machineId, value, onSelect, disabled, label, exclude = [] }: Props) {
+export default function TagSearch({ machineId, value, onSelect, onClear, disabled, label, exclude = [] }: Props) {
   const listId = useId()
   const [input, setInput] = useState(value?.display_name ?? '')
   const [query, setQuery] = useState('')
   const [open, setOpen] = useState(false)
   const [active, setActive] = useState(0)
+  const priorMachine = useRef(machineId)
   useEffect(() => setInput(value?.display_name ?? ''), [value?.key, value?.display_name])
+  useEffect(() => {
+    if (priorMachine.current !== machineId) {
+      priorMachine.current = machineId
+      setInput('')
+      onClear?.()
+    }
+  }, [machineId, onClear])
   useEffect(() => {
     const timer = window.setTimeout(() => setQuery(input === value?.display_name ? '' : input.trim()), 250)
     return () => window.clearTimeout(timer)
@@ -43,8 +52,9 @@ export default function TagSearch({ machineId, value, onSelect, disabled, label,
   }
   return <div className="relative">
     <label>{label}
-      <input role="combobox" aria-expanded={open} aria-controls={listId} aria-autocomplete="list" aria-activedescendant={options[active] ? `${listId}-${options[active].key}` : undefined} value={input} disabled={disabled} placeholder="Search display name, node ID, or OPC path" onFocus={() => setOpen(true)} onChange={(event) => { setInput(event.target.value); setOpen(true); setActive(0) }} onKeyDown={keyDown} />
+      <input role="combobox" aria-expanded={open} aria-controls={listId} aria-autocomplete="list" aria-invalid={Boolean(input && !value)} aria-activedescendant={options[active] ? `${listId}-${options[active].key}` : undefined} value={input} disabled={disabled} placeholder="Search display name, node ID, or OPC path" onFocus={() => setOpen(true)} onChange={(event) => { const next = event.target.value; if (value && next !== value.display_name) onClear?.(); setInput(next); setOpen(true); setActive(0) }} onKeyDown={keyDown} />
     </label>
+    {!disabled && input && !value && <p role="alert" className="mt-1 text-xs text-amber-300">Select a tag from the results.</p>}
     {open && <div id={listId} role="listbox" className="absolute z-30 mt-1 max-h-72 w-full overflow-y-auto rounded-lg border border-slate-600 bg-slate-950 p-1 shadow-2xl">
       {tags.isLoading && <p className="p-3 text-sm text-slate-400">Loading variables…</p>}
       {tags.isError && <p role="alert" className="p-3 text-sm text-red-300">Source tag search failed.</p>}

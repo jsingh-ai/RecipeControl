@@ -36,7 +36,7 @@ test('create rule, analyze, label, reload, detect duplicate, and change timezone
     if (path.includes('/trends')) return fulfill({ lookback_minutes: 15, series: [{ tag_id: 'temperature', display_name: 'Temperature', data_type: 'numeric', units: '°F', points: [{ minute_utc: '2026-06-11T19:50:00Z', value: '260', missing: false }] }] })
     if (path.endsWith('/classifications') && request.method() === 'GET') return fulfill(classification?.active ? [classification] : [])
     if (path.endsWith('/classifications') && request.method() === 'POST') { classification = { id: 9, name: JSON.parse(request.postData()!).name, active: true }; return fulfill(classification, 201) }
-    if (path.endsWith('/segments/50') && request.method() === 'PATCH') { label = JSON.parse(request.postData()!); return fulfill(segment()) }
+    if (path.endsWith('/analyses/20/segments/50') && request.method() === 'PATCH') { label = JSON.parse(request.postData()!); return fulfill(segment()) }
     return fulfill([])
   })
 

@@ -5,7 +5,6 @@ from sqlalchemy import (
     JSON,
     Boolean,
     CheckConstraint,
-    DateTime,
     ForeignKey,
     Index,
     Integer,
@@ -13,9 +12,18 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy import (
+    DateTime as SQLDateTime,
+)
+from sqlalchemy.dialects.mysql import DATETIME as MySQLDateTime
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.sql.type_api import TypeEngine
 
 from recipecontrol.database import Base, utc_now
+
+
+def DateTime(*, timezone: bool = False) -> TypeEngine[datetime]:
+    return SQLDateTime(timezone=timezone).with_variant(MySQLDateTime(fsp=6), "mysql")
 
 
 class TimestampMixin:

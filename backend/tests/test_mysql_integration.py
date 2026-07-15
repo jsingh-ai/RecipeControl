@@ -35,7 +35,7 @@ def source() -> MySQLSourceDataRepository:
         "CREATE TABLE tags (id BIGINT UNSIGNED PRIMARY KEY, machine_id BIGINT UNSIGNED NOT NULL, node_id VARCHAR(512) NOT NULL, opc_path TEXT, display_name VARCHAR(255) NULL, browse_name VARCHAR(255) NULL, data_type VARCHAR(120) NULL, parent_branch VARCHAR(120) NULL, enabled TINYINT(1) NOT NULL)",
         "CREATE TABLE tag_samples (id BIGINT UNSIGNED PRIMARY KEY, tag_id BIGINT UNSIGNED NOT NULL, machine_id BIGINT UNSIGNED NOT NULL, sampled_at_utc DATETIME(6) NOT NULL, source_timestamp_utc DATETIME(6) NULL, server_timestamp_utc DATETIME(6) NULL, value_numeric DOUBLE NULL, value_text TEXT NULL, quality VARCHAR(40) NOT NULL, status_code VARCHAR(120) NULL, error_text TEXT NULL, created_at_utc DATETIME(6) NOT NULL)",
         "INSERT INTO machines VALUES (1, 'Line A', 1), (2, 'Disabled Line', 0), (3, 'Line B', 1)",
-        "INSERT INTO tags VALUES (10,1,'ns=2;s=temp','Plant/Temp',' Motor Temp ',NULL,'Double',NULL,1),(11,1,'ns=2;s=run','Plant/Run','', 'Running','Boolean',NULL,1),(12,1,'ns=2;s=message','Plant/Alarm',NULL,'','String',NULL,1),(13,1,'ns=2;s=alarm','Plant/Code','Alarm Code',NULL,'Int32',NULL,1),(14,1,'ns=2;s=disabled',NULL,'Disabled',NULL,'Double',NULL,0),(30,3,'ns=2;s=other',NULL,'Other',NULL,'Double',NULL,1)",
+        "INSERT INTO tags VALUES (10,1,'ns=2;s=temp','Plant/Temp',' Motor Temp ',NULL,'Double',NULL,1),(11,1,'ns=2;s=run','Plant/Run','', 'Running','Boolean',NULL,1),(12,1,'ns=2;s=message','Plant/Alarm',NULL,'','String',NULL,1),(13,1,'ns=2;s=alarm','Plant/Code','Alarm Code',NULL,'Int32',NULL,1),(14,1,'ns=2;s=disabled',NULL,'Disabled',NULL,'Double',NULL,0),(15,1,'ns=2;s=decorated-double',NULL,'Z Decorated Double',NULL,'VariantType.Double',NULL,1),(16,1,'ns=2;s=decorated-bool',NULL,'Z Decorated Boolean',NULL,'System.Boolean',NULL,1),(30,3,'ns=2;s=other',NULL,'Other',NULL,'Double',NULL,1)",
         "INSERT INTO tag_samples (id,tag_id,machine_id,sampled_at_utc,value_numeric,value_text,quality,status_code,error_text,created_at_utc) VALUES (1,10,1,'2026-06-23 14:19:05.000000',5,NULL,'Good','Good',NULL,'2026-06-23 14:19:06'),(2,10,1,'2026-06-23 14:19:50.000000',7,NULL,'Uncertain','0x4000','late','2026-06-23 14:19:51'),(3,10,1,'2026-06-23 14:19:50.000000',8,NULL,'Good','Good',NULL,'2026-06-23 14:19:52'),(4,11,1,'2026-06-23 14:20:01.000000',1,NULL,'Good',NULL,NULL,'2026-06-23 14:20:02'),(5,11,1,'2026-06-23 14:20:02.000000',NULL,'false','Good',NULL,NULL,'2026-06-23 14:20:03'),(6,12,1,'2026-06-23 14:20:03.000000',NULL,'','Bad','BadText','alarm','2026-06-23 14:20:04'),(7,13,1,'2026-06-23 14:20:04.000000',12,NULL,'Good',NULL,NULL,'2026-06-23 14:20:05'),(8,10,1,'2026-06-23 14:20:05.000000',NULL,NULL,'Bad','Null',NULL,'2026-06-23 14:20:06'),(9,10,1,'2026-06-23 14:21:00.000000',99,NULL,'Good',NULL,NULL,'2026-06-23 14:21:01'),(10,10,3,'2026-06-23 14:20:05.000000',123,NULL,'Good',NULL,NULL,'2026-06-23 14:20:06')",
     ]
     with admin.begin() as connection:
@@ -58,7 +58,7 @@ def test_exact_collector_metadata_queries(source: MySQLSourceDataRepository) -> 
     page = source.search_tags("1", "plant", limit=2)
     assert page.has_more and len(page.items) == 2
     all_tags = source.search_tags("1", "", limit=20).items
-    assert [item.key for item in all_tags] == ["13", "10", "12", "11"]
+    assert [item.key for item in all_tags] == ["13", "10", "12", "11", "16", "15"]
     by_id = {item.key: item for item in all_tags}
     assert by_id["10"].display_name == "Motor Temp"
     assert by_id["11"].display_name == "Running"
@@ -68,9 +68,21 @@ def test_exact_collector_metadata_queries(source: MySQLSourceDataRepository) -> 
         "11": "boolean",
         "12": "text",
         "13": "numeric",
+        "15": "numeric",
+        "16": "boolean",
     }
     assert source.resolve_tags("1", ["14"]) == ()
     assert source.resolve_tags("1", ["30"]) == ()
+    diagnostics = source.diagnostics()
+    assert diagnostics["enabled_machine_count"] == 2
+    assert diagnostics["enabled_tag_count"] == 7
+    assert {item["raw_data_type"] for item in diagnostics["data_types"]} >= {
+        "Double",
+        "Boolean",
+        "String",
+        "VariantType.Double",
+        "System.Boolean",
+    }
 
 
 def test_exact_schema_sample_decoding_is_half_open_and_machine_scoped(
@@ -124,6 +136,14 @@ def test_exact_schema_rows_drive_latest_tie_and_gap_engine_semantics(
                         ConditionOperator.ABOVE_MAXIMUM,
                         maximum=Decimal("7"),
                     ),
+                    Condition(
+                        2,
+                        "10",
+                        "Motor Temp recovery",
+                        DataType.NUMERIC,
+                        ConditionOperator.BELOW_MINIMUM,
+                        minimum=Decimal("6"),
+                    ),
                 ),
             ),
         ),
@@ -142,8 +162,9 @@ def test_exact_schema_rows_drive_latest_tie_and_gap_engine_semantics(
     ]
     selected = result.minute_evaluations[1].snapshot["conditions"]["1"]
     assert selected["value"] == "8.0"
-    assert selected["source"] == {
-        "quality": "Good",
-        "status_code": "Good",
-        "error_text": None,
-    }
+    assert selected["source"]["quality"] == "Good"
+    assert selected["source"]["status_code"] == "Good"
+    assert selected["source"]["error_text"] is None
+    assert selected["source"]["sample_id"] == 3
+    assert selected["source"]["sampled_at_utc"].startswith("2026-06-23T14:19:50")
+    assert set(result.minute_evaluations[1].snapshot["conditions"]) == {"1", "2"}

@@ -1,0 +1,41 @@
+name: verify
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  local-and-browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: python -m venv .venv
+      - run: .venv/bin/pip install -e '.[dev]'
+      - run: npm ci
+        working-directory: frontend
+      - run: npx playwright install --with-deps chromium
+        working-directory: frontend
+      - run: make lint typecheck test build
+      - run: make test-e2e
+
+  mysql:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m venv .venv
+      - run: .venv/bin/pip install -e '.[dev]'
+      - run: make test-mysql-up
+      - run: make test-mysql
+      - if: always()
+        run: make test-mysql-down

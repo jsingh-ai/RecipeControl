@@ -12,9 +12,16 @@ export function segmentAppearance(segment: Segment): { color: string; text: stri
   return { color: '#64748b', text: `○ Unlabeled${identity}`, pattern }
 }
 
-function expression(condition: NonNullable<Timeline['conditions']>[number]): string {
+export function conditionExpression(condition: NonNullable<Timeline['conditions']>[number]): string {
+  const symbol: Record<string, string> = { BELOW_MINIMUM: '<', ABOVE_MAXIMUM: '>', OUTSIDE_RANGE: 'outside', EQUALS: '=', NOT_EQUALS: '≠', INCREASE_BY: 'increases by', DECREASE_BY: 'decreases by' }
   const threshold = condition.operator === 'BELOW_MINIMUM' ? condition.minimum : condition.operator === 'ABOVE_MAXIMUM' ? condition.maximum : condition.operator === 'OUTSIDE_RANGE' ? `${condition.minimum}–${condition.maximum}` : ['INCREASE_BY', 'DECREASE_BY'].includes(condition.operator) ? `${condition.delta_amount} / ${condition.delta_window_minutes} min` : String(condition.comparison_value ?? '')
-  return `${condition.display_name} · ${condition.operator.replaceAll('_', ' ')} ${threshold}${condition.duration_minutes ? ` · ${condition.duration_minutes} min` : ''}`
+  return `${condition.display_name} ${symbol[condition.operator] ?? condition.operator.replaceAll('_', ' ')} ${threshold}${condition.duration_minutes ? ` · ${condition.duration_minutes} min` : ''}`
+}
+
+export function showCachedMinute(cache: Map<string, MinuteDetail>, minute: string, show: () => void): boolean {
+  if (!cache.has(minute)) return false
+  show()
+  return true
 }
 
 function escapeHtml(value: unknown): string {
@@ -37,7 +44,7 @@ export default function TimelineChart({ timeline, zone, onSelect, autoFollow = f
     if (!ref.current) return
     const chart = echarts.init(ref.current)
     const conditionById = new Map((timeline.conditions ?? []).map((item) => [item.id, item]))
-    const lanes = ['Primary segments', ...conditionIds.map((id) => conditionById.has(id) ? expression(conditionById.get(id)!) : `Condition ${id}`)]
+    const lanes = ['Primary segments', ...conditionIds.map((id) => conditionById.has(id) ? conditionExpression(conditionById.get(id)!) : `Condition ${id}`)]
     const minuteCache = new Map<string, MinuteDetail>()
     let hoveredMinute: string | null = null
     let hoverTimer: number | undefined
@@ -64,7 +71,8 @@ export default function TimelineChart({ timeline, zone, onSelect, autoFollow = f
           const detail = hoveredMinute ? minuteCache.get(hoveredMinute) : undefined
           const evaluations = Object.values(detail?.conditions ?? {}).map((item) => `${escapeHtml(item.display_name)} (#${item.condition_id}): ${escapeHtml(item.value)} · ${escapeHtml(item.operator)} · raw ${escapeHtml(item.raw_matched)} · ${escapeHtml(item.pending_progress.current)}/${escapeHtml(item.pending_progress.required)} · qualified ${escapeHtml(item.qualified_active)}${item.delta_reference ? ` · reference ${escapeHtml(item.delta_reference.value)} at ${escapeHtml(item.delta_reference.minute_utc)}` : ''} · quality ${escapeHtml(item.source?.quality ?? '—')} / ${escapeHtml(item.source?.status_code ?? '—')}`).join('<br/>')
           const duration = Math.round((Date.parse(segment.end_utc) - Date.parse(segment.start_utc)) / 60_000)
-          return `<strong>${escapeHtml(segmentAppearance(segment).text)}</strong><br/>${escapeHtml(segment.system_state)} · ${duration} minutes<br/>${escapeHtml(formatTime(segment.start_utc, zone))} – ${escapeHtml(formatTime(segment.end_utc, zone))}<br/>Hovered minute: ${escapeHtml(hoveredMinute ? formatTime(hoveredMinute, zone) : 'move within segment')}<br/>Classification: ${escapeHtml(segment.classification_name || 'none')}<br/>Active reasons: ${escapeHtml(detail?.active_condition_ids.join(', ') || 'none')}<br/>Groups: ${escapeHtml(JSON.stringify(detail?.groups ?? {}))} · root ${escapeHtml(detail?.root_expression_result)}<br/>Missing: ${escapeHtml(detail?.missing_tag_ids.join(', ') || 'none')}<br/>Training: ${escapeHtml(detail?.training_eligible ? 'eligible' : detail?.training_ineligibility_reason ?? 'loading exact minute…')}<br/>${evaluations}`
+          const activeNames = Object.values(detail?.conditions ?? {}).filter((item) => detail?.active_condition_ids.includes(item.condition_id)).map((item) => item.display_name).join(', ')
+          return `<strong>${escapeHtml(segmentAppearance(segment).text)}</strong><br/>${escapeHtml(segment.system_state)} · ${duration} minutes<br/>${escapeHtml(formatTime(segment.start_utc, zone))} – ${escapeHtml(formatTime(segment.end_utc, zone))}<br/>Hovered minute: ${escapeHtml(hoveredMinute ? formatTime(hoveredMinute, zone) : 'move within segment')}<br/>Classification: ${escapeHtml(segment.classification_name || 'none')}<br/>Active reasons: ${escapeHtml(activeNames || 'none')}<br/>Groups: ${escapeHtml(JSON.stringify(detail?.groups ?? {}))} · root ${escapeHtml(detail?.root_expression_result)}<br/>Missing: ${escapeHtml(detail?.missing_tag_ids.join(', ') || 'none')}<br/>Training: ${escapeHtml(detail?.training_eligible ? 'eligible' : detail?.training_ineligibility_reason ?? 'loading exact minute…')}<br/>${evaluations}`
         },
       },
       series: [{
@@ -95,7 +103,7 @@ export default function TimelineChart({ timeline, zone, onSelect, autoFollow = f
       const segmentIndex = segments.findIndex((item) => Date.parse(item.start_utc) <= clicked && clicked < Date.parse(item.end_utc))
       if (segmentIndex < 0) return
       hoveredMinute = new Date(clicked).toISOString()
-      if (minuteCache.has(hoveredMinute)) return
+      if (showCachedMinute(minuteCache, hoveredMinute, () => chart.dispatchAction({ type: 'showTip', seriesIndex: 0, dataIndex: segmentIndex }))) return
       window.clearTimeout(hoverTimer)
       hoverTimer = window.setTimeout(() => {
         const requestedMinute = hoveredMinute!
