@@ -154,18 +154,40 @@ async def health(session: SessionDep) -> dict[str, object]:
     return checks
 
 
-@router.get("/machines", response_model=list[MachineOut])
-async def machines(session: SessionDep, include_inactive: bool = False) -> list[MachineModel]:
+def _refresh_machine_catalog(session: Session) -> str | None:
     try:
         sync_machine_catalog(session, list(get_source_repository().list_machines()))
         session.commit()
-    except Exception as error:
+        return None
+    except Exception:
         session.rollback()
-        raise HTTPException(503, "Source database unavailable") from error
+        logger.exception("source_machine_sync_failed_using_local_catalog")
+        return "Source synchronization is unavailable; showing the last saved machine catalog."
+
+
+def _local_machines(session: Session, *, include_inactive: bool) -> list[MachineModel]:
     statement = select(MachineModel)
     if not include_inactive:
         statement = statement.where(MachineModel.enabled)
     return list(session.scalars(statement.order_by(MachineModel.name, MachineModel.id)))
+
+
+@router.get("/machines", response_model=list[MachineOut])
+async def machines(session: SessionDep, include_inactive: bool = False) -> list[MachineModel]:
+    _refresh_machine_catalog(session)
+    return _local_machines(session, include_inactive=include_inactive)
+
+
+@router.get("/machine-catalog")
+async def machine_catalog(session: SessionDep) -> dict[str, object]:
+    warning = _refresh_machine_catalog(session)
+    return {
+        "items": [
+            MachineOut.model_validate(item).model_dump()
+            for item in _local_machines(session, include_inactive=True)
+        ],
+        "source_sync_warning": warning,
+    }
 
 
 @router.get("/machines/{machine_id}/tags")
@@ -517,6 +539,7 @@ async def get_analysis(analysis_id: int, session: SessionDep) -> dict[str, objec
             "state": job.state,
             "attempt_count": job.attempt_count,
             "heartbeat_at": job.heartbeat_at,
+            "persistence_lease_until": job.persistence_lease_until,
         }
         if job
         else None
@@ -575,6 +598,8 @@ async def timeline(analysis_id: int, session: SessionDep) -> dict[str, object]:
                 "delta_amount": condition.delta_amount,
                 "delta_window_minutes": condition.delta_window_minutes,
                 "duration_minutes": condition.duration_minutes,
+                "group_id": group.id,
+                "group_operator": group.internal_operator,
             }
             for group in analysis.rule_version.groups
             for condition in group.conditions
@@ -661,9 +686,8 @@ async def update_segment(
         classification = session.get(ClassificationModel, payload.classification_id)
         if (
             classification is None
-            or not classification.active
-            or analysis is None
             or classification.rule_version_id != analysis.rule_version_id
+            or (not classification.active and segment.classification_id != classification.id)
         ):
             raise HTTPException(422, "Classification is unavailable for this rule version")
     segment.quality_label = payload.quality_label

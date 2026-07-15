@@ -7,7 +7,7 @@ import { MinuteDetail, RuleVersion, Segment, Tag, Timeline } from '../api'
 import RuleBuilder, { operatorsFor, ruleFormSchema, serializeRule, sortVersions } from '../RuleBuilder'
 import SegmentDetail from '../SegmentDetail'
 import TagSearch from '../TagSearch'
-import TimelineChart, { segmentAppearance, showCachedMinute } from '../TimelineChart'
+import TimelineChart, { conditionMinuteTooltip, hoverDataIndex, SegmentNavigator, segmentAppearance, showCachedMinute } from '../TimelineChart'
 import TimelinePage from '../TimelinePage'
 import { formatTime } from '../time'
 
@@ -91,6 +91,21 @@ describe('timeline presentation', () => {
     expect(onSelect).toHaveBeenCalledWith(segment, '2026-06-11T20:05:00.000Z')
   })
 
+  it('paginates a large accessible segment navigator instead of rendering every segment', async () => {
+    const segments = Array.from({ length: 1001 }, (_, index) => ({
+      ...segment,
+      id: index + 1,
+      start_utc: new Date(Date.parse(segment.start_utc) + index * 60_000).toISOString(),
+      end_utc: new Date(Date.parse(segment.start_utc) + (index + 1) * 60_000).toISOString(),
+    }))
+    render(<SegmentNavigator segments={segments} zone="UTC" onSelect={vi.fn()} />)
+    expect(screen.getAllByRole('button', { name: /Unlabeled/ })).toHaveLength(20)
+    expect(screen.getByText('Showing 1–20 of 1001')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Next' }))
+    expect(screen.getByText('Showing 21–40 of 1001')).toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: /Unlabeled/ })).toHaveLength(20)
+  })
+
   it('refreshes A after hovering A, B, then cached A', () => {
     const detail = (minute: string, value: string) => ({ minute_utc: minute, conditions: { 1: { value } } }) as unknown as MinuteDetail
     const cache = new Map<string, MinuteDetail>([['A', detail('A', '100')], ['B', detail('B', '200')]])
@@ -99,6 +114,28 @@ describe('timeline presentation', () => {
     expect(showCachedMinute(cache, 'B', () => { visible = String(cache.get('B')?.conditions['1'].value) })).toBe(true)
     expect(showCachedMinute(cache, 'A', () => { visible = String(cache.get('A')?.conditions['1'].value) })).toBe(true)
     expect(visible).toBe('100')
+  })
+
+  it('uses cached exact-minute detail for a condition-lane tooltip', () => {
+    const condition = { id: 1, tag_id: 'temperature', display_name: 'Motor Temperature', raw_data_type: 'Double', data_kind: 'numeric' as const, operator: 'ABOVE_MAXIMUM', maximum: '250', duration_minutes: 5, group_id: 9, group_operator: 'AND' as const }
+    const minute = {
+      analysis_id: 1,
+      minute_utc: '2026-06-11T20:05:00Z',
+      segment,
+      conditions: { '1': { condition_id: 1, tag_id: 'temperature', display_name: 'Motor Temperature', value: '261', operator: 'ABOVE_MAXIMUM', maximum: '250', duration_minutes: 5, raw_matched: true, pending_progress: { current: 3, required: 5 }, qualified_active: false, lane_state: 'PENDING', delta_reference: { minute_utc: '2026-06-11T19:55:00Z', value: '240' }, source: { quality: 'Uncertain', status_code: '0x4000', error_text: 'late source value' } } },
+      groups: { '9': false }, root_expression_result: false, active_condition_ids: [], missing_tag_ids: [], training_eligible: false, training_ineligibility_reason: 'A Good or Bad label is required',
+    } as MinuteDetail
+    const intervals = [{ id: 2, condition_id: 1, start_utc: segment.start_utc, end_utc: segment.end_utc, state: 'PENDING' }]
+    expect(hoverDataIndex([segment], intervals, [1], Date.parse(minute.minute_utc), 1)).toBe(1)
+    const cache = new Map([[minute.minute_utc, minute]])
+    let tooltip = ''
+    expect(showCachedMinute(cache, minute.minute_utc, () => { tooltip = conditionMinuteTooltip(condition, minute, 'UTC') })).toBe(true)
+    expect(tooltip).toContain('Motor Temperature &gt; 250 · 5 min')
+    expect(tooltip).toContain('Value: 261')
+    expect(tooltip).toContain('Raw matched: true · pending 3/5 · qualified false')
+    expect(tooltip).toContain('Group 9 (AND): false · root: false')
+    expect(tooltip).toContain('Uncertain / 0x4000 · error late source value')
+    expect(tooltip).toContain('Delta reference: 240')
   })
 })
 
@@ -125,12 +162,33 @@ describe('tag search integrity', () => {
 })
 
 describe('analysis workflow', () => {
+  it('lists inactive machines, warns on stale source sync, and opens saved history', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/machine-catalog')) return response({ items: [{ id: 1, name: 'Active Line', source_key: 'active', enabled: true }, { id: 2, name: 'Retired Line', source_key: 'retired', enabled: false }], source_sync_warning: 'Source synchronization is unavailable; showing the last saved machine catalog.' })
+      if (url.includes('/rule-sets')) return response([{ id: 2, machine_id: 2, name: 'Historical Rule', archived: false, versions: [version] }])
+      if (url.includes('/analyses?')) return response([{ id: 22, machine_id: 2, rule_version_id: 3, selected_start_utc: segment.start_utc, selected_end_utc: segment.end_utc, mode: 'HISTORICAL', status: 'COMPLETE' }])
+      if (url.endsWith('/analyses/22')) return response({ id: 22, machine_id: 2, rule_version_id: 3, selected_start_utc: segment.start_utc, selected_end_utc: segment.end_utc, mode: 'HISTORICAL', status: 'COMPLETE' })
+      if (url.endsWith('/analyses/22/timeline')) return response({ analysis: { id: 22, machine_id: 2, rule_version_id: 3, selected_start_utc: segment.start_utc, selected_end_utc: segment.end_utc, mode: 'HISTORICAL', status: 'COMPLETE' }, segments: [{ ...segment, analysis_id: 22 }], condition_intervals: [], boundaries: [], conditions: version.groups[0].conditions })
+      return response({})
+    }))
+    render(<TimelinePage />, { wrapper })
+    expect(await screen.findByRole('alert')).toHaveTextContent('Source synchronization is unavailable')
+    await userEvent.selectOptions(screen.getByLabelText('Timeline machine'), '2')
+    expect(screen.getByRole('option', { name: 'Retired Line (Inactive)' })).toBeInTheDocument()
+    expect(await screen.findByRole('status')).toHaveTextContent('Inactive machine')
+    await userEvent.selectOptions(await screen.findByLabelText('Saved rule version'), '3')
+    expect(screen.getByRole('button', { name: 'Analyze' })).toBeDisabled()
+    await userEvent.selectOptions(await screen.findByLabelText('Load saved analysis'), '22')
+    expect(await screen.findByRole('img', { name: /primary and condition timeline lanes/i })).toBeInTheDocument()
+  })
+
   it('closes Analysis A drawer when saved Analysis B is selected', async () => {
     const writes: string[] = []
     vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
       if (init?.method === 'PATCH') writes.push(url)
-      if (url.endsWith('/machines')) return response([{ id: 1, name: 'Line 1', source_key: 'line', enabled: true }])
+      if (url.endsWith('/machine-catalog')) return response({ items: [{ id: 1, name: 'Line 1', source_key: 'line', enabled: true }], source_sync_warning: null })
       if (url.includes('/rule-sets')) return response([{ id: 2, machine_id: 1, name: 'Rule', archived: false, versions: [version] }])
       if (url.includes('/analyses?')) return response([{ id: 10, machine_id: 1, rule_version_id: 3, selected_start_utc: segment.start_utc, selected_end_utc: segment.end_utc, mode: 'HISTORICAL', status: 'COMPLETE' }, { id: 20, machine_id: 1, rule_version_id: 3, selected_start_utc: segment.start_utc, selected_end_utc: segment.end_utc, mode: 'HISTORICAL', status: 'COMPLETE' }])
       if (url.endsWith('/analyses/10') || url.endsWith('/analyses/20')) return response({ id: url.endsWith('/10') ? 10 : 20, machine_id: 1, rule_version_id: 3, selected_start_utc: segment.start_utc, selected_end_utc: segment.end_utc, mode: 'HISTORICAL', status: 'COMPLETE' })
@@ -155,7 +213,7 @@ describe('analysis workflow', () => {
   it('shows both duplicate actions', async () => {
     vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
-      if (url.endsWith('/machines')) return response([{ id: 1, name: 'Line 1', source_key: 'line', enabled: true }])
+      if (url.endsWith('/machine-catalog')) return response({ items: [{ id: 1, name: 'Line 1', source_key: 'line', enabled: true }], source_sync_warning: null })
       if (url.includes('/rule-sets')) return response([{ id: 2, machine_id: 1, name: 'Rule', archived: false, versions: [version] }])
       if (url.includes('/analyses?')) return response([])
       if (url.endsWith('/analyses') && init?.method === 'POST') return response({ code: 'DUPLICATE_ANALYSIS', message: 'An analysis already exists for this definition and period.', matches: [{ id: 9, status: 'COMPLETE' }] }, 409)
@@ -174,7 +232,7 @@ describe('analysis workflow', () => {
   it('surfaces a sanitized non-duplicate analysis creation error', async () => {
     vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
-      if (url.endsWith('/machines')) return response([{ id: 1, name: 'Line 1', source_key: 'line', enabled: true }])
+      if (url.endsWith('/machine-catalog')) return response({ items: [{ id: 1, name: 'Line 1', source_key: 'line', enabled: true }], source_sync_warning: null })
       if (url.includes('/rule-sets')) return response([{ id: 2, machine_id: 1, name: 'Rule', archived: false, versions: [version] }])
       if (url.includes('/analyses?')) return response([])
       if (url.endsWith('/analyses') && init?.method === 'POST') return response({ detail: 'Source database unavailable' }, 503)
@@ -189,7 +247,7 @@ describe('analysis workflow', () => {
   })
 
   it('blocks an end minute before the start minute', async () => {
-    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => String(input).endsWith('/machines') ? response([]) : response([])))
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => String(input).endsWith('/machine-catalog') ? response({ items: [], source_sync_warning: null }) : response([])))
     render(<TimelinePage />, { wrapper })
     await userEvent.clear(screen.getByLabelText('Start minute (UTC)'))
     await userEvent.type(screen.getByLabelText('Start minute (UTC)'), '2026-06-24T00:00')
@@ -198,7 +256,7 @@ describe('analysis workflow', () => {
   })
 
   it('toggles timezone presentation control', async () => {
-    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => String(input).endsWith('/machines') ? response([]) : response([])))
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => String(input).endsWith('/machine-catalog') ? response({ items: [], source_sync_warning: null }) : response([])))
     render(<TimelinePage />, { wrapper })
     const central = screen.getByRole('button', { name: 'Central' })
     expect(central).toHaveAttribute('aria-pressed', 'false')
@@ -244,6 +302,34 @@ describe('analysis workflow', () => {
     render(<SegmentDetail segment={segment} clickedUtc="2026-06-11T20:05:00Z" analysisId={1} machineId={1} version={version} zone="UTC" onClose={() => {}} />, { wrapper })
     expect(await screen.findByRole('option', { name: 'Active category' })).toBeInTheDocument()
     expect(screen.queryByRole('option', { name: 'Retired category' })).not.toBeInTheDocument()
+  })
+
+  it('preserves and labels a currently assigned retired classification but hides it elsewhere', async () => {
+    const writes: Array<{ classification_id: number | null; quality_label: string | null; note: string | null }> = []
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/classifications')) return response([{ id: 4, name: 'Active category', active: true }, { id: 6, name: 'Old category', active: false }])
+      if (url.includes('/trends')) return response({ series: [] })
+      if (url.includes('/minutes/')) return response({ conditions: {}, active_condition_ids: [], missing_tag_ids: [], groups: {}, root_expression_result: false, training_eligible: true })
+      if (url.includes('/segments/7') && init?.method === 'PATCH') {
+        const body = JSON.parse(String(init.body)); writes.push(body)
+        return response({ ...segment, classification_id: body.classification_id, classification_name: body.classification_id ? 'Old category' : null, quality_label: body.quality_label, note: body.note })
+      }
+      return response({ items: [], limit: 25, offset: 0, has_more: false })
+    }))
+    const retired = { ...segment, classification_id: 6, classification_name: 'Old category', note: 'Original' }
+    const view = render(<SegmentDetail segment={retired} clickedUtc="2026-06-11T20:05:00Z" analysisId={1} machineId={1} version={version} zone="UTC" onClose={() => {}} />, { wrapper })
+    expect(await screen.findByRole('option', { name: 'Old category (Retired)' })).toBeInTheDocument()
+    await userEvent.click(screen.getByLabelText(/Good/))
+    await userEvent.clear(screen.getByLabelText('Notes'))
+    await userEvent.type(screen.getByLabelText('Notes'), 'Updated after retirement')
+    await userEvent.click(screen.getByRole('button', { name: 'Save segment label' }))
+    await waitFor(() => expect(writes[0]).toMatchObject({ classification_id: 6, quality_label: 'GOOD', note: 'Updated after retirement' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Clear classification' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Save segment label' }))
+    await waitFor(() => expect(writes[1].classification_id).toBeNull())
+    view.rerender(<SegmentDetail segment={{ ...segment, id: 8 }} clickedUtc="2026-06-11T20:15:00Z" analysisId={1} machineId={1} version={version} zone="UTC" onClose={() => {}} />)
+    await waitFor(() => expect(screen.queryByRole('option', { name: 'Old category (Retired)' })).not.toBeInTheDocument())
   })
 
   it('resets unsaved annotation fields when switching directly between segments', async () => {

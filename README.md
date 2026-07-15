@@ -25,6 +25,8 @@ Open `http://localhost:5173`. API documentation is at `http://localhost:8000/doc
 
 The fixture source supports any UTC range. The timeline form includes the requested preset from `2026-06-11 19:50` through `2026-06-23 14:20` UTC. Historical analyses are queued; keep `make worker` running. Live mode is experimental and disabled by default.
 
+Timeline includes inactive locally known machines so their saved analyses remain reviewable. If source synchronization is temporarily unavailable, Timeline shows a warning and continues from the application database. Inactive machines cannot create definitions, analyses, or live sessions.
+
 ## Docker development
 
 The Compose stack uses MySQL 8.4 for writable RecipeControl data and the fixture source by default. Replace the `APP_DB_PASSWORD` and `APP_DB_ROOT_PASSWORD` placeholders in the uncommitted `.env` first:
@@ -34,6 +36,8 @@ docker compose up --build
 ```
 
 Compose refuses to start without those uncommitted passwords. To connect a real source, configure the exact collector URL described in `docs/source-schema.md`.
+
+For a production VM, use the nginx-based image and internal-only API/database stack in `docker-compose.prod.yml`. The complete first-deploy, backup/restore, health, update, rollback, host-MySQL, and external-Docker-network procedures are in [VM deployment](docs/vm-deployment.md). RecipeControl has no user authentication yet; keep production access behind a LAN, VPN, firewall, authenticated gateway, or SSH tunnel.
 
 ## Live source configuration
 
@@ -86,8 +90,10 @@ make test-mysql     # exact collector schema + application MySQL historical work
 make test-mysql-down # remove isolated MySQL test services and volumes
 make test-mysql-all # run the three MySQL steps with cleanup on exit
 make e2e            # Playwright critical workflow
+make e2e-visual     # capture 24 deterministic viewport screenshots under docs/screenshots/visual
 make e2e-real       # unmocked migrated API + worker + fixture + frontend workflow
 make build          # production frontend build
+make compose-prod-check # validate production Compose interpolation and structure
 make checks         # every check above plus Playwright
 make verify         # local checks, real-stack browser flow, and isolated MySQL tests
 ```
@@ -136,6 +142,8 @@ Historical analysis is the supported MVP. `ENABLE_LIVE_MODE=false` and `VITE_ENA
 - `no such table`: run `make migrate` with the same `APP_DATABASE_URL` used by the API and workers.
 - Analysis remains queued: start `make worker`; inspect the analysis job status and server logs.
 - A worker that stops heartbeating is reclaimed after `STALE_JOB_TIMEOUT_SECONDS`; jobs fail with a sanitized message after `HISTORICAL_JOB_MAX_ATTEMPTS`.
+- During atomic result persistence, the background heartbeat writer stops and the job uses `HISTORICAL_PERSISTENCE_LEASE_SECONDS` (default 900 seconds). This avoids SQLite writer contention while protecting valid MySQL persistence from stale-job reclaim.
+- Retired classifications disappear from future choices, but a segment already carrying one may preserve or clear it while its quality label or note is edited.
 - Live mode is unavailable: this is expected while `ENABLE_LIVE_MODE=false`; historical analysis remains fully available.
 - Source health fails: verify the read-only URL, network path, and exact mapping variables. Errors returned to the browser are intentionally redacted.
 - MySQL datetime appears naive: the adapter intentionally attaches UTC because `sampled_at_utc` is authoritative UTC.

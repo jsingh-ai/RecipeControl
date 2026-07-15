@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     tag_search_default_limit: int = Field(default=50, ge=1, le=200)
     stale_job_timeout_seconds: int = Field(default=300, ge=30)
     historical_job_max_attempts: int = Field(default=3, ge=1, le=20)
+    historical_persistence_lease_seconds: int = Field(default=900, ge=60, le=7200)
     enable_live_mode: bool = False
 
     @model_validator(mode="after")

@@ -16,4 +16,6 @@ locally without deleting immutable definitions or historical analyses.
 
 Historical job claiming uses an atomic conditional `QUEUED` to `RUNNING` update so competing workers cannot claim the same row. Workers heartbeat while streamed samples are consumed. Stale jobs are reclaimed until a bounded retry limit, then fail with a sanitized UI message. Output replacement, including batched exact-minute rows, is idempotent and transactional. Analysis completion occurs in that same commit.
 
+Before atomic output persistence, the heartbeat thread is joined and a bounded ownership lease is committed. Persistence is therefore the only SQLite writer, while MySQL reclaimers leave a valid persistence transaction alone until its lease expires. A source synchronization failure preserves the local machine catalog so inactive and temporarily offline historical analyses remain browsable.
+
 The browser uses TanStack Query for server state, React Hook Form plus Zod for rule validation, ECharts custom series for compressed Gantt lanes, and `Intl.DateTimeFormat` with `America/Chicago` for Central presentation. UTC remains canonical.

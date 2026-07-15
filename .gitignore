@@ -1,4 +1,5 @@
 .env
+.env.production
 .venv/
 __pycache__/
 *.py[cod]
@@ -11,4 +12,5 @@ frontend/node_modules/
 frontend/dist/
 frontend/playwright-report/
 frontend/test-results/
+docs/screenshots/visual/.generated-at
 *.tsbuildinfo
