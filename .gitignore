@@ -1,5 +1,5 @@
 .env
-.env.production
+.env.windows
 .venv/
 __pycache__/
 *.py[cod]
@@ -10,6 +10,8 @@ __pycache__/
 *.sqlite*
 frontend/node_modules/
 frontend/dist/
+logs/
+backups/
 frontend/playwright-report/
 frontend/test-results/
 docs/screenshots/visual/.generated-at

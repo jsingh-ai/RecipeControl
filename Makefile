@@ -1,4 +1,4 @@
-.PHONY: setup migrate seed backend worker live-worker frontend lint typecheck test test-backend test-frontend test-mysql-up test-mysql test-mysql-down test-mysql-all test-e2e e2e e2e-real e2e-visual build checks verify source-smoke compose-prod-check
+.PHONY: setup migrate seed backend worker live-worker frontend lint typecheck test test-backend test-frontend test-mysql test-e2e e2e e2e-real e2e-visual build checks verify source-smoke
 
 setup:
 	python3 -m venv .venv
@@ -51,19 +51,8 @@ e2e-visual:
 
 test-e2e: e2e e2e-real
 
-test-mysql-up:
-	docker compose -f docker-compose.test.yml up -d --wait
-	.venv/bin/python scripts/wait_for_test_mysql.py
-
 test-mysql:
-	TEST_COLLECTOR_MYSQL_URL=mysql+pymysql://root@127.0.0.1:3308/opcua_collector_test .venv/bin/pytest backend/tests/test_mysql_integration.py
-	TEST_APP_MYSQL_URL=mysql+pymysql://root@127.0.0.1:3309/recipecontrol_test .venv/bin/pytest backend/tests/test_migrations.py backend/mysql_tests/test_app_mysql_workflow.py
-
-test-mysql-down:
-	docker compose -f docker-compose.test.yml down -v
-
-test-mysql-all:
-	bash scripts/run_mysql_tests.sh
+	.venv/bin/pytest backend/tests/test_mysql_integration.py backend/tests/test_migrations.py backend/mysql_tests/test_app_mysql_workflow.py
 
 source-smoke:
 	.venv/bin/python -m recipecontrol.source_smoke health
@@ -71,9 +60,6 @@ source-smoke:
 build:
 	cd frontend && npm run build
 
-compose-prod-check:
-	docker compose --env-file .env.production.example -f docker-compose.prod.yml config --quiet
-
 checks: lint typecheck test build e2e
 
-verify: checks e2e-real test-mysql-all
+verify: checks e2e-real test-mysql

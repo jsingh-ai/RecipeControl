@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     historical_job_max_attempts: int = Field(default=3, ge=1, le=20)
     historical_persistence_lease_seconds: int = Field(default=900, ge=60, le=7200)
     enable_live_mode: bool = False
+    serve_frontend: bool = False
+    frontend_dist_path: str = "frontend/dist"
 
     @model_validator(mode="after")
     def separate_source_credential(self) -> "Settings":

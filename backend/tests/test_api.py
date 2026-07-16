@@ -1,11 +1,15 @@
+import asyncio
 import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
+from recipecontrol.api import create_app
+from recipecontrol.config import get_settings
 from recipecontrol.database import SessionLocal, utc_now
 from recipecontrol.live_worker import process_live_once
 from recipecontrol.models import (
@@ -26,6 +30,40 @@ from recipecontrol.worker import (
     run_once,
     touch_heartbeat,
 )
+
+
+def test_native_windows_frontend_serves_spa_and_keeps_api_404s(tmp_path, monkeypatch) -> None:
+    frontend_dist = tmp_path / "dist"
+    assets = frontend_dist / "assets"
+    assets.mkdir(parents=True)
+    (frontend_dist / "index.html").write_text(
+        "<!doctype html><title>RecipeControl native</title>", encoding="utf-8"
+    )
+    (assets / "app.js").write_text("window.recipeControl = true", encoding="utf-8")
+    native_settings = get_settings().model_copy(
+        update={
+            "serve_frontend": True,
+            "frontend_dist_path": str(frontend_dist),
+        }
+    )
+    monkeypatch.setattr("recipecontrol.api.get_settings", lambda: native_settings)
+
+    native_app = create_app()
+    route_by_path = {getattr(route, "path", None): route for route in native_app.routes}
+
+    assert "/assets" in route_by_path
+    health_route = route_by_path["/health"]
+    assert asyncio.run(health_route.endpoint()) == {"ok": True}
+
+    spa_route = route_by_path["/{requested_path:path}"]
+    root_response = asyncio.run(spa_route.endpoint(requested_path=""))
+    nested_response = asyncio.run(spa_route.endpoint(requested_path="timeline/saved/12"))
+    asset_response = asyncio.run(spa_route.endpoint(requested_path="index.html"))
+    assert root_response.path == frontend_dist / "index.html"
+    assert nested_response.path == frontend_dist / "index.html"
+    assert asset_response.path == frontend_dist / "index.html"
+    with pytest.raises(HTTPException, match="API route not found"):
+        asyncio.run(spa_route.endpoint(requested_path="api/not-a-real-route"))
 
 
 def saved_rule(client: TestClient) -> tuple[int, int]:

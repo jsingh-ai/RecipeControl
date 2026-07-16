@@ -4,11 +4,13 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import case, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
@@ -943,6 +945,10 @@ def create_app() -> FastAPI:
         started = time.perf_counter()
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
         logger.info(
             "request_complete request_id=%s method=%s path=%s status=%s elapsed_ms=%.2f",
             request_id,
@@ -954,6 +960,36 @@ def create_app() -> FastAPI:
         return response
 
     app.include_router(router)
+
+    if settings.serve_frontend:
+        frontend_dist = Path(settings.frontend_dist_path).resolve()
+        index_file = frontend_dist / "index.html"
+        assets_directory = frontend_dist / "assets"
+        if not index_file.is_file() or not assets_directory.is_dir():
+            raise RuntimeError(
+                "SERVE_FRONTEND is enabled but the frontend build is missing; "
+                "run 'npm ci' and 'npm run build' in the frontend directory"
+            )
+
+        app.mount("/assets", StaticFiles(directory=assets_directory), name="frontend-assets")
+
+        @app.get("/health", include_in_schema=False)
+        async def frontend_health() -> dict[str, bool]:
+            return {"ok": True}
+
+        @app.get("/{requested_path:path}", include_in_schema=False)
+        async def frontend_spa(requested_path: str) -> FileResponse:
+            if requested_path == "api" or requested_path.startswith("api/"):
+                raise HTTPException(404, "API route not found")
+            requested_file = (frontend_dist / requested_path).resolve()
+            if (
+                requested_path
+                and requested_file.is_relative_to(frontend_dist)
+                and requested_file.is_file()
+            ):
+                return FileResponse(requested_file)
+            return FileResponse(index_file)
+
     logging.basicConfig(
         level=settings.log_level,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
