@@ -9,7 +9,7 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from datetime import timedelta
 
-from sqlalchemy import delete, insert, select, update
+from sqlalchemy import delete, insert, or_, select, update
 from sqlalchemy.orm import Session
 
 from recipecontrol.config import get_settings
@@ -30,78 +30,167 @@ from recipecontrol.source.base import Sample
 logger = logging.getLogger("recipecontrol.worker")
 
 
-def touch_heartbeat(job_id: int) -> None:
+class HeartbeatError(RuntimeError):
+    """Raised when the worker can no longer persist its ownership heartbeat."""
+
+
+class HeartbeatMonitor:
+    def __init__(self) -> None:
+        self.error: BaseException | None = None
+
+    def check(self) -> None:
+        if self.error is not None:
+            raise HeartbeatError("Analysis heartbeat failed") from self.error
+
+
+def touch_heartbeat(job_id: int, claimed_by: str | None = None) -> None:
     with SessionLocal() as heartbeat_session:
-        heartbeat_session.execute(
-            update(AnalysisJobModel)
-            .where(AnalysisJobModel.id == job_id, AnalysisJobModel.state == "RUNNING")
-            .values(heartbeat_at=utc_now())
+        criteria = [
+            AnalysisJobModel.id == job_id,
+            AnalysisJobModel.state == "RUNNING",
+        ]
+        if claimed_by is not None:
+            criteria.append(AnalysisJobModel.claimed_by == claimed_by)
+        updated = heartbeat_session.execute(
+            update(AnalysisJobModel).where(*criteria).values(heartbeat_at=utc_now())
         )
+        if getattr(updated, "rowcount", 0) != 1:
+            heartbeat_session.rollback()
+            raise HeartbeatError("Analysis heartbeat no longer owns a running job")
         heartbeat_session.commit()
 
 
 @contextmanager
-def background_heartbeat(job_id: int) -> Iterator[None]:
-    interval = min(10.0, max(1.0, get_settings().stale_job_timeout_seconds / 3))
+def background_heartbeat(
+    job_id: int,
+    *,
+    claimed_by: str | None = None,
+    interval_seconds: float | None = None,
+) -> Iterator[HeartbeatMonitor]:
+    interval = interval_seconds or min(10.0, max(1.0, get_settings().stale_job_timeout_seconds / 3))
     stopped = threading.Event()
+    monitor = HeartbeatMonitor()
 
     def pulse() -> None:
-        while not stopped.wait(interval):
-            touch_heartbeat(job_id)
+        try:
+            while not stopped.wait(interval):
+                touch_heartbeat(job_id, claimed_by)
+        except BaseException as error:
+            monitor.error = error
+            stopped.set()
 
     thread = threading.Thread(target=pulse, name=f"analysis-heartbeat-{job_id}", daemon=True)
     thread.start()
+    body_failed = False
     try:
-        yield
+        yield monitor
+    except BaseException:
+        body_failed = True
+        raise
     finally:
         stopped.set()
-        thread.join(timeout=interval + 1)
+        # Persistence must never begin while the heartbeat writer is still alive.
+        thread.join()
+        if monitor.error is not None:
+            if body_failed:
+                logger.error(
+                    "heartbeat_failed_while_job_also_failed job_id=%s",
+                    job_id,
+                    exc_info=(
+                        type(monitor.error),
+                        monitor.error,
+                        monitor.error.__traceback__,
+                    ),
+                )
+            else:
+                monitor.check()
 
 
 def recover_stale_jobs(session: Session) -> int:
     settings = get_settings()
-    cutoff = utc_now() - timedelta(seconds=settings.stale_job_timeout_seconds)
+    now = utc_now()
+    cutoff = now - timedelta(seconds=settings.stale_job_timeout_seconds)
     stale = list(
-        session.scalars(
-            select(AnalysisJobModel).where(
+        session.execute(
+            select(
+                AnalysisJobModel.id,
+                AnalysisJobModel.analysis_id,
+                AnalysisJobModel.attempt_count,
+            ).where(
                 AnalysisJobModel.state == "RUNNING",
                 AnalysisJobModel.heartbeat_at < cutoff,
+                or_(
+                    AnalysisJobModel.persistence_lease_until.is_(None),
+                    AnalysisJobModel.persistence_lease_until < now,
+                ),
             )
         )
     )
-    now = utc_now()
-    for job in stale:
-        analysis = session.get(AnalysisModel, job.analysis_id)
-        if job.attempt_count < settings.historical_job_max_attempts:
-            job.state = "QUEUED"
-            job.claimed_by = None
-            job.claimed_at = None
-            job.heartbeat_at = None
-            job.error_details = "stale_worker_reclaimed"
-            if analysis is not None:
-                analysis.status = "QUEUED"
-                analysis.error_message = None
-        else:
-            job.state = "FAILED"
-            job.finished_at = now
-            job.error_details = "stale_worker_retry_limit"
-            if analysis is not None:
-                analysis.status = "FAILED"
-                analysis.completed_at = now
-                analysis.error_message = (
-                    "Analysis worker stopped before completion. Retry limit reached."
+    recovered = 0
+    for job_id, analysis_id, attempt_count in stale:
+        criteria = (
+            AnalysisJobModel.id == job_id,
+            AnalysisJobModel.state == "RUNNING",
+            AnalysisJobModel.heartbeat_at < cutoff,
+            or_(
+                AnalysisJobModel.persistence_lease_until.is_(None),
+                AnalysisJobModel.persistence_lease_until < now,
+            ),
+        )
+        if attempt_count < settings.historical_job_max_attempts:
+            claimed = session.execute(
+                update(AnalysisJobModel)
+                .where(*criteria)
+                .values(
+                    state="QUEUED",
+                    claimed_by=None,
+                    claimed_at=None,
+                    heartbeat_at=None,
+                    persistence_lease_until=None,
+                    error_details="stale_worker_reclaimed",
                 )
-    if stale:
+            )
+            if getattr(claimed, "rowcount", 0) != 1:
+                continue
+            session.execute(
+                update(AnalysisModel)
+                .where(AnalysisModel.id == analysis_id)
+                .values(status="QUEUED", error_message=None)
+            )
+        else:
+            claimed = session.execute(
+                update(AnalysisJobModel)
+                .where(*criteria)
+                .values(
+                    state="FAILED",
+                    finished_at=now,
+                    persistence_lease_until=None,
+                    error_details="stale_worker_retry_limit",
+                )
+            )
+            if getattr(claimed, "rowcount", 0) != 1:
+                continue
+            session.execute(
+                update(AnalysisModel)
+                .where(AnalysisModel.id == analysis_id)
+                .values(
+                    status="FAILED",
+                    completed_at=now,
+                    error_message=(
+                        "Analysis worker stopped before completion. Retry limit reached."
+                    ),
+                )
+            )
+        recovered += 1
+    if recovered:
         session.commit()
-    return len(stale)
+        session.expire_all()
+    return recovered
 
 
-def heartbeating_samples(samples: Iterable[Sample], job_id: int) -> Iterator[Sample]:
-    next_heartbeat = time.monotonic() + 10
+def monitored_samples(samples: Iterable[Sample], heartbeat: HeartbeatMonitor) -> Iterator[Sample]:
     for sample in samples:
-        if time.monotonic() >= next_heartbeat:
-            touch_heartbeat(job_id)
-            next_heartbeat = time.monotonic() + 10
+        heartbeat.check()
         yield sample
 
 
@@ -123,6 +212,7 @@ def claim_one(session: Session, worker_id: str) -> int | None:
             claimed_by=worker_id,
             claimed_at=now,
             heartbeat_at=now,
+            persistence_lease_until=None,
             attempt_count=AnalysisJobModel.attempt_count + 1,
         )
     )
@@ -142,9 +232,10 @@ def process_job(job_id: int) -> None:
         analysis.status = "RUNNING"
         analysis.started_at = utc_now()
         job.heartbeat_at = utc_now()
+        claimed_by = job.claimed_by
         session.commit()
         try:
-            with background_heartbeat(job_id):
+            with background_heartbeat(job_id, claimed_by=claimed_by) as heartbeat:
                 definition = version_to_domain(analysis.rule_version)
                 tag_kinds = {
                     condition.tag_key: condition.data_type.value
@@ -161,12 +252,31 @@ def process_job(job_id: int) -> None:
                     selected_end + timedelta(minutes=1),
                 )
                 result = segment_timeline(
-                    definition, heartbeating_samples(samples, job_id), start, selected_end
+                    definition, monitored_samples(samples, heartbeat), start, selected_end
                 )
-                touch_heartbeat(job_id)
+                heartbeat.check()
 
-                # End the read transaction before atomically replacing generated output.
-                session.commit()
+            # Publish a bounded ownership lease before taking the atomic write lock. The
+            # background writer is fully stopped, so SQLite has exactly one writer during
+            # generated-output replacement. MySQL reclaimers honor the same lease.
+            now = utc_now()
+            job.heartbeat_at = now
+            job.persistence_lease_until = now + timedelta(
+                seconds=get_settings().historical_persistence_lease_seconds
+            )
+            session.commit()
+            try:
+                ownership = session.execute(
+                    update(AnalysisJobModel)
+                    .where(
+                        AnalysisJobModel.id == job_id,
+                        AnalysisJobModel.state == "RUNNING",
+                        AnalysisJobModel.claimed_by == claimed_by,
+                    )
+                    .values(persistence_lease_until=job.persistence_lease_until)
+                )
+                if getattr(ownership, "rowcount", 0) != 1:
+                    raise HeartbeatError("Analysis lost ownership before persistence")
                 session.execute(
                     delete(BoundaryEventModel).where(BoundaryEventModel.analysis_id == analysis.id)
                 )
@@ -214,7 +324,6 @@ def process_job(job_id: int) -> None:
                     if len(minute_rows) == 1000:
                         session.execute(insert(AnalysisMinuteModel), minute_rows)
                         minute_rows.clear()
-                        touch_heartbeat(job_id)
                 if minute_rows:
                     session.execute(insert(AnalysisMinuteModel), minute_rows)
                 for interval in result.condition_intervals:
@@ -252,9 +361,13 @@ def process_job(job_id: int) -> None:
                 analysis.error_message = None
                 job.state = "COMPLETE"
                 job.heartbeat_at = utc_now()
+                job.persistence_lease_until = None
                 job.finished_at = utc_now()
                 job.error_details = None
                 session.commit()
+            except BaseException:
+                session.rollback()
+                raise
             logger.info(
                 "analysis_complete job_id=%s analysis_id=%s rows=%s segments=%s elapsed_ms=%.2f",
                 job.id,
@@ -268,7 +381,12 @@ def process_job(job_id: int) -> None:
             logger.exception("analysis_failed analysis_id=%s", analysis.id)
             failed_job = session.get(AnalysisJobModel, job_id)
             failed_analysis = session.get(AnalysisModel, analysis.id)
-            if failed_job and failed_analysis:
+            if (
+                failed_job
+                and failed_analysis
+                and failed_job.state == "RUNNING"
+                and failed_job.claimed_by == claimed_by
+            ):
                 settings = get_settings()
                 failed_job.error_details = type(error).__name__
                 if failed_job.attempt_count < settings.historical_job_max_attempts:
@@ -276,15 +394,22 @@ def process_job(job_id: int) -> None:
                     failed_job.claimed_by = None
                     failed_job.claimed_at = None
                     failed_job.heartbeat_at = None
+                    failed_job.persistence_lease_until = None
                     failed_analysis.status = "QUEUED"
                     failed_analysis.error_message = None
                 else:
                     failed_job.state = "FAILED"
                     failed_job.finished_at = utc_now()
+                    failed_job.persistence_lease_until = None
                     failed_analysis.status = "FAILED"
                     failed_analysis.error_message = "Analysis generation failed; see server logs."
                     failed_analysis.completed_at = utc_now()
                 session.commit()
+            else:
+                logger.warning(
+                    "analysis_failure_ignored_after_ownership_loss job_id=%s",
+                    job_id,
+                )
 
 
 def run_once(worker_id: str | None = None) -> bool:

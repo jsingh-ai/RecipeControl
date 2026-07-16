@@ -1,0 +1,95 @@
+x-backend-environment: &backend-environment
+  APP_DATABASE_URL: mysql+pymysql://recipecontrol:${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env.production}@app-db:3306/recipecontrol
+  SOURCE_ADAPTER: mysql
+  SOURCE_DATABASE_URL: ${SOURCE_DATABASE_URL:?set read-only SOURCE_DATABASE_URL in .env.production}
+  CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  STALE_JOB_TIMEOUT_SECONDS: ${STALE_JOB_TIMEOUT_SECONDS:-300}
+  HISTORICAL_JOB_MAX_ATTEMPTS: ${HISTORICAL_JOB_MAX_ATTEMPTS:-3}
+  HISTORICAL_PERSISTENCE_LEASE_SECONDS: ${HISTORICAL_PERSISTENCE_LEASE_SECONDS:-900}
+  ENABLE_LIVE_MODE: ${ENABLE_LIVE_MODE:-false}
+
+x-backend-service: &backend-service
+  build:
+    context: .
+    dockerfile: backend/Dockerfile
+  environment: *backend-environment
+  extra_hosts:
+    - host.docker.internal:host-gateway
+  restart: unless-stopped
+
+services:
+  app-db:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: recipecontrol
+      MYSQL_USER: recipecontrol
+      MYSQL_PASSWORD: ${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env.production}
+      MYSQL_ROOT_PASSWORD: ${APP_DB_ROOT_PASSWORD:?set APP_DB_ROOT_PASSWORD in .env.production}
+    volumes:
+      - recipecontrol_app_db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p\"$${MYSQL_ROOT_PASSWORD}\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  migrate:
+    <<: *backend-service
+    restart: "no"
+    depends_on:
+      app-db:
+        condition: service_healthy
+    command: ["alembic", "upgrade", "head"]
+
+  api:
+    <<: *backend-service
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 15s
+
+  worker:
+    <<: *backend-service
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    command: ["recipecontrol-worker"]
+
+  live-worker:
+    <<: *backend-service
+    profiles: ["live"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    command: ["recipecontrol-live-worker"]
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        VITE_API_URL: /api
+        VITE_ENABLE_LIVE_MODE: "false"
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${HTTP_PORT:-80}:80"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  recipecontrol_app_db:

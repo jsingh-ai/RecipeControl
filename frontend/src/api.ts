@@ -1,4 +1,4 @@
-export const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000/api'
+export const API_URL = import.meta.env.VITE_API_URL ?? '/api'
 
 export class ApiError extends Error {
   constructor(public status: number, public body: any) {
@@ -17,6 +17,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export type Machine = { id: number; source_key: string; name: string; enabled: boolean }
+export type MachineCatalog = { items: Machine[]; source_sync_warning: string | null }
 export type DataKind = 'numeric' | 'text' | 'boolean'
 export type Tag = { key: string; display_name: string; raw_data_type: string | null; data_kind: DataKind; units?: string; node_id?: string; opc_path?: string }
 export type TagPage = { items: Tag[]; limit: number; offset: number; has_more: boolean }
@@ -73,7 +74,7 @@ export type Timeline = {
   segments: Segment[]
   condition_intervals: Array<{ id: number; condition_id: number; start_utc: string; end_utc: string; state: string }>
   boundaries: Array<{ id: number; boundary_utc: string; explanation: string; context: any }>
-  conditions?: Array<{ id: number; tag_id: string; display_name: string; raw_data_type: string | null; data_kind: DataKind; operator: string; minimum?: string | null; maximum?: string | null; comparison_value?: unknown; delta_amount?: string | null; delta_window_minutes?: number | null; duration_minutes: number }>
+  conditions?: Array<{ id: number; tag_id: string; display_name: string; raw_data_type: string | null; data_kind: DataKind; operator: string; minimum?: string | null; maximum?: string | null; comparison_value?: unknown; delta_amount?: string | null; delta_window_minutes?: number | null; duration_minutes: number; group_id?: number; group_operator?: 'AND' | 'OR' }>
 }
 
 export type MinuteDetail = {

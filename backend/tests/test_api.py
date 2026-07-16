@@ -1,3 +1,4 @@
+import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -9,13 +10,22 @@ from recipecontrol.database import SessionLocal, utc_now
 from recipecontrol.live_worker import process_live_once
 from recipecontrol.models import (
     AnalysisJobModel,
+    AnalysisMinuteModel,
     AnalysisModel,
     ClassificationModel,
     SegmentModel,
 )
 from recipecontrol.source.base import Machine, Sample, Tag, TagPage
 from recipecontrol.source.fixture import FixtureSourceDataRepository
-from recipecontrol.worker import claim_one, process_job, recover_stale_jobs, run_once
+from recipecontrol.worker import (
+    HeartbeatError,
+    background_heartbeat,
+    claim_one,
+    process_job,
+    recover_stale_jobs,
+    run_once,
+    touch_heartbeat,
+)
 
 
 def saved_rule(client: TestClient) -> tuple[int, int]:
@@ -336,6 +346,50 @@ def test_worker_timeline_label_classification_and_snapshot(client: TestClient) -
     assert reloaded["classification_name"] == "Roll Change"
 
 
+def test_retired_classification_is_preserved_only_on_its_existing_segment(
+    client: TestClient,
+) -> None:
+    machine_id, version_id = saved_rule(client)
+    first_id = create_analysis(client, machine_id, version_id).json()["id"]
+    second_id = create_analysis(client, machine_id, version_id, create_duplicate=True).json()["id"]
+    assert run_once("retired-classification-first")
+    assert run_once("retired-classification-second")
+    first_segment = client.get(f"/api/analyses/{first_id}/timeline").json()["segments"][0]
+    second_segment = client.get(f"/api/analyses/{second_id}/timeline").json()["segments"][0]
+    classification = client.post(
+        f"/api/rule-versions/{version_id}/classifications",
+        json={"name": "Retired existing annotation"},
+    ).json()
+    assigned = client.patch(
+        f"/api/analyses/{first_id}/segments/{first_segment['id']}",
+        json={"quality_label": "GOOD", "classification_id": classification["id"]},
+    )
+    assert assigned.status_code == 200
+    assert client.delete(f"/api/classifications/{classification['id']}").status_code == 200
+
+    preserved = client.patch(
+        f"/api/analyses/{first_id}/segments/{first_segment['id']}",
+        json={
+            "quality_label": "UNSURE",
+            "classification_id": classification["id"],
+            "note": "Quality and note changed after retirement",
+        },
+    )
+    assert preserved.status_code == 200
+    assert preserved.json()["classification_name"] == "Retired existing annotation"
+    rejected = client.patch(
+        f"/api/analyses/{second_id}/segments/{second_segment['id']}",
+        json={"classification_id": classification["id"]},
+    )
+    assert rejected.status_code == 422
+    cleared = client.patch(
+        f"/api/analyses/{first_id}/segments/{first_segment['id']}",
+        json={"classification_id": None, "note": "Classification cleared"},
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()["classification_id"] is None
+
+
 def test_system_segments_can_be_labeled_but_are_not_training_eligible(client: TestClient) -> None:
     machine_id, version_id = saved_rule(client)
     analysis_id = create_analysis(client, machine_id, version_id).json()["id"]
@@ -483,6 +537,87 @@ def test_failed_job_has_no_partial_output(client: TestClient, monkeypatch) -> No
         )
 
 
+def test_sqlite_worker_persists_more_than_one_minute_batch(client: TestClient) -> None:
+    machine_id, version_id = saved_rule(client)
+    analysis_id = create_analysis(
+        client,
+        machine_id,
+        version_id,
+        selected_end_utc="2026-06-12T12:30:00Z",
+    ).json()["id"]
+    assert run_once("sqlite-1001-minute-worker")
+    with SessionLocal() as session:
+        analysis = session.get(AnalysisModel, analysis_id)
+        assert analysis is not None and analysis.status == "COMPLETE"
+        assert (
+            session.scalar(
+                select(func.count(AnalysisMinuteModel.id)).where(
+                    AnalysisMinuteModel.analysis_id == analysis_id
+                )
+            )
+            == 1001
+        )
+
+
+def test_sqlite_worker_completes_full_16951_minute_preset(client: TestClient) -> None:
+    machine_id, version_id = saved_rule(client)
+    analysis_id = create_analysis(
+        client,
+        machine_id,
+        version_id,
+        selected_end_utc="2026-06-23T14:20:00Z",
+    ).json()["id"]
+    assert run_once("sqlite-full-preset-worker")
+    with SessionLocal() as session:
+        analysis = session.get(AnalysisModel, analysis_id)
+        assert analysis is not None and analysis.status == "COMPLETE"
+        assert (
+            session.scalar(
+                select(func.count(AnalysisMinuteModel.id)).where(
+                    AnalysisMinuteModel.analysis_id == analysis_id
+                )
+            )
+            == 16_951
+        )
+    segments = client.get(f"/api/analyses/{analysis_id}/timeline").json()["segments"]
+    assert segments[0]["start_utc"].startswith("2026-06-11T19:50")
+    assert segments[-1]["end_utc"].startswith("2026-06-23T14:21")
+    assert all(
+        left["end_utc"] == right["start_utc"]
+        for left, right in zip(segments, segments[1:], strict=False)
+    )
+
+
+def test_background_heartbeat_failure_is_propagated(monkeypatch) -> None:
+    def fail(_job_id: int) -> None:
+        raise RuntimeError("heartbeat database unavailable")
+
+    monkeypatch.setattr("recipecontrol.worker.touch_heartbeat", fail)
+    with (
+        pytest.raises(HeartbeatError, match="heartbeat failed"),
+        background_heartbeat(123, interval_seconds=0.01),
+    ):
+        time.sleep(0.03)
+
+
+def test_heartbeat_rejects_a_replaced_worker_owner(client: TestClient) -> None:
+    machine_id, version_id = saved_rule(client)
+    analysis_id = create_analysis(client, machine_id, version_id).json()["id"]
+    with SessionLocal() as session:
+        job = session.scalar(
+            select(AnalysisJobModel).where(AnalysisJobModel.analysis_id == analysis_id)
+        )
+        assert job is not None
+        job.state = "RUNNING"
+        job.claimed_by = "replacement-worker"
+        job.heartbeat_at = utc_now()
+        session.commit()
+        job_id = job.id
+
+    with pytest.raises(HeartbeatError, match="no longer owns"):
+        touch_heartbeat(job_id, "stale-worker")
+
+
 def test_stale_job_is_reclaimed_then_fails_at_retry_limit(client: TestClient) -> None:
     machine_id, version_id = saved_rule(client)
     analysis_id = create_analysis(client, machine_id, version_id).json()["id"]
@@ -494,6 +629,10 @@ def test_stale_job_is_reclaimed_then_fails_at_retry_limit(client: TestClient) ->
         job.state = "RUNNING"
         job.attempt_count = 1
         job.heartbeat_at = utc_now() - timedelta(hours=1)
+        job.persistence_lease_until = utc_now() + timedelta(minutes=5)
+        session.commit()
+        assert recover_stale_jobs(session) == 0
+        job.persistence_lease_until = utc_now() - timedelta(seconds=1)
         session.commit()
         assert recover_stale_jobs(session) == 1
         assert job.state == "QUEUED"
@@ -608,6 +747,61 @@ def test_machine_catalog_disables_removed_and_reenables_returned_source_machine(
     visible.append(Machine("m2", "Machine Two Restored"))
     restored = client.get("/api/machines").json()
     assert next(item for item in restored if item["id"] == machine_two["id"])["enabled"] is True
+
+
+def test_inactive_machine_history_remains_available_when_source_sync_fails(
+    client: TestClient, monkeypatch
+) -> None:
+    machine_id, version_id = saved_rule(client)
+    analysis_id = create_analysis(client, machine_id, version_id).json()["id"]
+    assert run_once("inactive-history-worker")
+
+    source = FixtureSourceDataRepository()
+    monkeypatch.setattr(source, "list_machines", lambda: ())
+    monkeypatch.setattr("recipecontrol.api.get_source_repository", lambda: source)
+    inactive_catalog = client.get("/api/machine-catalog").json()
+    inactive = next(item for item in inactive_catalog["items"] if item["id"] == machine_id)
+    assert inactive["enabled"] is False
+
+    def unavailable():
+        raise RuntimeError("collector temporarily unavailable")
+
+    monkeypatch.setattr(source, "list_machines", unavailable)
+    stale_catalog = client.get("/api/machine-catalog")
+    assert stale_catalog.status_code == 200
+    assert stale_catalog.json()["source_sync_warning"]
+    assert (
+        next(item for item in stale_catalog.json()["items"] if item["id"] == machine_id)["enabled"]
+        is False
+    )
+    assert client.get(f"/api/analyses?machine_id={machine_id}").status_code == 200
+    timeline = client.get(f"/api/analyses/{analysis_id}/timeline")
+    assert timeline.status_code == 200
+    segment = timeline.json()["segments"][0]
+    assert (
+        client.get(f"/api/analyses/{analysis_id}/minutes/{segment['start_utc']}").status_code == 200
+    )
+    assert (
+        client.patch(
+            f"/api/analyses/{analysis_id}/segments/{segment['id']}",
+            json={"quality_label": "GOOD", "note": "Reviewed while source offline"},
+        ).status_code
+        == 200
+    )
+    assert create_analysis(client, machine_id, version_id, create_duplicate=True).status_code == 422
+    assert (
+        client.post(
+            "/api/rule-sets", json={"machine_id": machine_id, "name": "Inactive blocked"}
+        ).status_code
+        == 422
+    )
+    assert (
+        client.post(
+            "/api/live-sessions",
+            json={"machine_id": machine_id, "rule_version_id": version_id},
+        ).status_code
+        == 404
+    )
 
 
 def test_blank_names_and_invalid_analysis_range_are_rejected(client: TestClient) -> None:

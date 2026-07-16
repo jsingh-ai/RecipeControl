@@ -5,6 +5,7 @@ import { useFieldArray, useForm } from 'react-hook-form'
 import { z } from 'zod'
 import { api, DataKind, Machine, RuleSet, RuleVersion, Tag } from './api'
 import TagSearch from './TagSearch'
+import { Alert, EmptyState } from './ui'
 
 const conditionSchema = z.object({
   source_tag_key: z.string().min(1, 'Choose a variable'),
@@ -129,14 +130,14 @@ export default function RuleBuilder() {
 
   const preview = watched.groups?.map((group) => `(${(group.conditions ?? []).map((item) => `${item.source_display_name || 'Variable'} ${item.operator.replaceAll('_', ' ').toLowerCase()}`).join(` ${group.internal_operator} `)})`).join(` ${watched.root_operator} `)
 
-  return <main className="mx-auto max-w-7xl space-y-5 p-6" aria-label="Rule builder">
+  return <main className="app-shell max-w-[1500px]" aria-label="Rule builder">
     <header>
-      <p className="text-sm uppercase tracking-[0.3em] text-cyan-400">Definition studio</p>
-      <h1 className="text-3xl font-bold">Build a break definition</h1>
-      <p className="mt-2 text-slate-400">Saved versions are immutable and belong to one machine.</p>
+      <p className="section-kicker">Definition studio</p>
+      <h1 className="mt-1 text-3xl font-black tracking-tight sm:text-4xl">Build a break definition</h1>
+      <p className="mt-2 text-slate-400">Compose operator-readable groups from authoritative source tags. Locked versions remain immutable.</p>
     </header>
 
-    <section className="panel grid gap-4 md:grid-cols-[1fr_2fr_auto]">
+    <section className="toolbar grid gap-4 md:grid-cols-[1fr_2fr_auto]">
       <label>Machine
         <select aria-label="Machine" value={machineId} onChange={(event) => { setMachineId(Number(event.target.value) || ''); setVersion(null); form.reset({ root_operator: 'OR', groups: [{ internal_operator: 'AND', conditions: [blankCondition()] }] }) }} disabled={Boolean(version)}>
           <option value="">Choose machine</option>
@@ -147,17 +148,17 @@ export default function RuleBuilder() {
         <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Example: Production break rules" disabled={Boolean(version)} />
       </label>
       {!version ? <button className="button-primary self-end" disabled={!machineId || !name.trim() || create.isPending} onClick={() => create.mutate()}>Create Draft</button>
-        : <div className="flex items-center gap-2 self-end"><span className="badge bg-slate-700">v{version.version_number} · {version.status}</span><button type="button" className="button-secondary" onClick={() => { setVersion(null); setName('') }}>Close</button></div>}
+        : <div className="flex items-center gap-2 self-end"><span className={'badge ' + (version.status === 'LOCKED' ? 'badge-good' : 'border-amber-600/50 bg-amber-950 text-amber-200')}><span aria-hidden="true">{version.status === 'LOCKED' ? '✓' : '◷'}</span><span>v{version.version_number} · {version.status}</span></span><button type="button" className="button-secondary" onClick={() => { setVersion(null); setName('') }}>Close</button></div>}
     </section>
 
-    {machineId && <section className="panel space-y-3" aria-label="Definition versions"><div className="flex items-center justify-between"><div><h2 className="text-lg font-semibold">Saved definitions</h2><p className="text-sm text-slate-400">Machine: {machines.data?.find((item) => item.id === machineId)?.name}</p></div><label className="flex-row items-center"><input type="checkbox" checked={showArchived} onChange={(event) => setShowArchived(event.target.checked)} /> Show archived</label></div>{ruleSets.isLoading && <p>Loading definitions…</p>}{ruleSets.data?.length === 0 && <p className="text-slate-400">No saved definitions for this machine.</p>}<div className="grid gap-2 md:grid-cols-2">{ruleSets.data?.map((ruleSet) => { const ordered = sortVersions(ruleSet.versions); return <article key={ruleSet.id} className="rounded-xl border border-slate-700 p-3"><div className="flex justify-between gap-2"><h3 className="font-semibold">{ruleSet.name}</h3>{ruleSet.archived && <span className="badge bg-slate-700">Archived</span>}</div><div className="mt-2 flex flex-wrap gap-2">{ordered.map((item) => <button type="button" className="button-secondary" key={item.id} onClick={() => { setVersion(item); setName(ruleSet.name) }}>v{item.version_number} · {item.status}</button>)}</div>{!ruleSet.archived && <div className="mt-3 flex gap-2"><button type="button" className="button-secondary" onClick={() => { const selected = ordered.at(-1); if (selected) setVersion(selected) }}>Open latest</button><button type="button" className="button-secondary text-red-300" disabled={archive.isPending} onClick={() => archive.mutate(ruleSet.id)}>Archive</button></div>}</article> })}</div></section>}
+    {machineId && <section className="panel space-y-3" aria-label="Definition versions"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="section-kicker">Version browser</p><h2 className="text-lg font-semibold">Saved definitions</h2><p className="text-sm text-slate-400">Machine: {machines.data?.find((item) => item.id === machineId)?.name}</p></div><label className="flex-row items-center"><input className="size-4 min-h-0 w-4" type="checkbox" checked={showArchived} onChange={(event) => setShowArchived(event.target.checked)} /> Show archived</label></div>{ruleSets.isLoading && <div className="skeleton h-20 w-full" role="status" aria-label="Loading definitions" />}{ruleSets.data?.length === 0 && <EmptyState title="No definitions yet" description="Create the first draft for this machine using the controls above." />}<div className="grid gap-3 md:grid-cols-2">{ruleSets.data?.map((ruleSet) => { const ordered = sortVersions(ruleSet.versions); return <article key={ruleSet.id} className="panel-subtle"><div className="flex justify-between gap-2"><h3 className="font-semibold">{ruleSet.name}</h3>{ruleSet.archived && <span className="badge badge-muted">Archived</span>}</div><div className="mt-3 flex flex-wrap gap-2">{ordered.map((item) => <button type="button" className="button-secondary" key={item.id} onClick={() => { setVersion(item); setName(ruleSet.name) }}><span aria-hidden="true">{item.status === 'LOCKED' ? '✓ ' : '◷ '}</span><span>v{item.version_number} · {item.status}</span></button>)}</div>{!ruleSet.archived && <div className="mt-3 flex gap-2"><button type="button" className="button-secondary" onClick={() => { const selected = ordered.at(-1); if (selected) setVersion(selected) }}>Open latest</button><button type="button" className="button-destructive" disabled={archive.isPending} onClick={() => archive.mutate(ruleSet.id)}>Archive</button></div>}</article> })}</div></section>}
 
     {version && <form className="space-y-4" onSubmit={(event) => event.preventDefault()}>
-      <section className="panel flex flex-wrap items-end gap-4">
+      <section className="toolbar flex flex-wrap items-end gap-4">
         <label>Root operator between groups
           <select aria-label="Root operator" {...form.register('root_operator')} disabled={version.status === 'LOCKED'}><option>OR</option><option>AND</option></select>
         </label>
-        <div className="min-w-64 flex-1 rounded-lg bg-slate-950 p-3 text-sm text-slate-300"><strong>Expression:</strong> {preview}</div>
+        <div className="min-w-64 flex-1 rounded-xl border border-slate-800 bg-slate-950 p-3 text-sm text-slate-300"><span className="section-kicker mb-1 block">Expression preview</span>{preview}</div>
       </section>
 
       {groups.fields.map((field, groupIndex) => <section className="panel space-y-4" key={field.id}>
@@ -197,18 +198,18 @@ export default function RuleBuilder() {
             </label>}
             {['INCREASE_BY', 'DECREASE_BY'].includes(operator) && <><label>Delta amount<input disabled={version.status === 'LOCKED'} type="number" min="0" step="any" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.delta_amount`)} /></label><label>Window minutes<input disabled={version.status === 'LOCKED'} type="number" min="1" step="1" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.delta_window_minutes`)} /></label></>}
             <label>Activation minutes<input type="number" min="0" step="1" {...form.register(`groups.${groupIndex}.conditions.${conditionIndex}.duration_minutes`)} disabled={version.status === 'LOCKED'} /></label>
-            <button type="button" className="button-secondary self-end" disabled={version.status === 'LOCKED'} onClick={() => removeCondition(groupIndex, conditionIndex)}>Remove</button>
+            <button type="button" className="button-destructive self-end" disabled={version.status === 'LOCKED'} onClick={() => removeCondition(groupIndex, conditionIndex)}>Remove</button>
           </div>
         })}
         <button type="button" className="button-secondary" disabled={version.status === 'LOCKED'} onClick={() => addCondition(groupIndex)}>Add Condition</button>
       </section>)}
 
-      <div className="flex gap-3">
+      <div className="sticky bottom-3 z-10 flex flex-wrap gap-3 rounded-xl border border-slate-700 bg-slate-950/95 p-3 shadow-2xl backdrop-blur">
         {version.status === 'DRAFT' && <><button type="button" className="button-secondary" onClick={() => groups.append({ internal_operator: 'AND', conditions: [blankCondition()] })}>Add Group</button><button className="button-secondary" type="button" disabled={persist.isPending} onClick={form.handleSubmit((values) => persist.mutate({ values, lock: false }))}>Save Draft</button><button className="button-primary" type="button" disabled={persist.isPending} onClick={form.handleSubmit((values) => persist.mutate({ values, lock: true }))}>Save & Lock Version</button></>}
         {version.status === 'LOCKED' && !selectedRuleSet?.archived && <button type="button" className="button-primary" onClick={() => newVersion.mutate()}>Create New Blank Version</button>}
       </div>
-      {Object.keys(form.formState.errors).length > 0 && <p role="alert" className="text-red-300">Fix the highlighted rule fields. Every saved group needs a valid condition.</p>}
+      {Object.keys(form.formState.errors).length > 0 && <Alert tone="error">Fix the highlighted rule fields. Every saved group needs a selected tag and valid condition.</Alert>}
     </form>}
-    {(notice || create.error || persist.error || newVersion.error) && <p role={create.error || persist.error || newVersion.error ? 'alert' : 'status'} className="panel">{notice || create.error?.message || persist.error?.message || newVersion.error?.message}</p>}
+    {(notice || create.error || persist.error || newVersion.error) && <Alert tone={create.error || persist.error || newVersion.error ? 'error' : 'success'}>{notice || create.error?.message || persist.error?.message || newVersion.error?.message}</Alert>}
   </main>
 }

@@ -1,0 +1,16 @@
+# Optional override for a collector MySQL container on an existing Docker network.
+# Usage:
+# docker compose --env-file .env.production -f docker-compose.prod.yml \
+#   -f docker-compose.collector-network.yml up -d --build
+services:
+  api:
+    networks: [default, collector]
+  worker:
+    networks: [default, collector]
+  live-worker:
+    networks: [default, collector]
+
+networks:
+  collector:
+    external: true
+    name: ${COLLECTOR_DOCKER_NETWORK:?set COLLECTOR_DOCKER_NETWORK in .env.production}

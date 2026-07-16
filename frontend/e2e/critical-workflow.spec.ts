@@ -14,6 +14,7 @@ test('create rule, analyze, label, reload, detect duplicate, and change timezone
     const request = route.request(); const url = new URL(request.url()); const path = url.pathname
     const fulfill = (body: unknown, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
     if (path.endsWith('/machines')) return fulfill([machine])
+    if (path.endsWith('/machine-catalog')) return fulfill({ items: [machine], source_sync_warning: null })
     if (path.includes('/machines/1/tags')) return fulfill({ items: [{ key: 'temperature', display_name: 'Temperature', raw_data_type: 'Double', data_kind: 'numeric', units: '°F' }, { key: 'pressure', display_name: 'Pressure', raw_data_type: 'Double', data_kind: 'numeric', units: 'psi' }, { key: 'speed', display_name: 'Speed', raw_data_type: 'Double', data_kind: 'numeric', units: 'ft/min' }, { key: 'alarm_code', display_name: 'Alarm Code', raw_data_type: 'Int32', data_kind: 'numeric' }, { key: 'motor_running', display_name: 'Motor Running', raw_data_type: 'Boolean', data_kind: 'boolean' }], limit: 25, offset: 0, has_more: false })
     if (path.endsWith('/rule-sets') && request.method() === 'POST') return fulfill({ rule_set_id: 5, version: version() }, 201)
     if (path.includes('/rule-versions/10') && request.method() === 'PUT') {
