@@ -1,340 +1,407 @@
 # RecipeControl
 
-RecipeControl is a local, single-user MVP for building immutable time-based break definitions over minute-bucketed OPC-UA samples, generating complete Gantt-style timelines, and labeling individual segments for later training use. It never writes to a PLC or collector table.
+RecipeControl is a historical, single-user application for building immutable time-based break definitions over minute-bucketed OPC UA samples, generating complete timelines, and labeling segments. It writes only to its own application database. It never writes to PLCs or collector-owned tables.
 
-## Which instructions should I use?
+This repository is designed to run natively on a Windows VM without a container runtime or separate web server.
 
-Use **Production VM: step by step** when RecipeControl will read your collector MySQL database. This is the recommended deployment path. It builds the React application into nginx, runs the API and historical worker in containers, and stores RecipeControl data in its own persistent MySQL volume.
+## Security boundary
 
-Use **Local development with fixture data** when you only want to evaluate or develop the application without connecting to a collector database.
+RecipeControl does not have user authentication. Keep TCP port 8000 behind a trusted LAN, VPN, Windows Firewall rule, authenticated reverse proxy, or SSH tunnel. Do not expose it directly to the public internet.
 
-RecipeControl does not have user authentication. Keep a deployed instance behind a trusted LAN, VPN, firewall, authenticated reverse proxy, or SSH tunnel. Do not expose it directly to the public internet.
+Use two different MySQL accounts:
 
-## Production VM: step by step
+- A writable account limited to the separate RecipeControl application database.
+- A SELECT-only account limited to the existing collector database.
 
-### 1. Prepare the VM
+Never point APP_DATABASE_URL at opcua_collector. Never give the application source account write privileges.
 
-Install Git, Docker Engine, and the Docker Compose plugin. A practical minimum is 4 GB RAM plus enough disk for minute snapshots and database backups.
+## What runs on the Windows VM
 
-Confirm that the commands are available:
+The native deployment has three components:
+
+1. MySQL 8.0 or newer, installed on the VM or reachable over the network.
+2. One FastAPI process that serves both the production React application and /api.
+3. One historical worker process that handles queued analyses.
+
+The React development server is not used in production. Node.js is needed during installation and updates to build frontend/dist, after which FastAPI serves those static files on the same port as the API.
+
+Live mode remains disabled. Do not start recipecontrol.live_worker.
+
+## Windows VM deployment: step by step
+
+### 1. Install prerequisites
+
+Install these 64-bit applications:
+
+- Git for Windows
+- Python 3.12, including the Python Launcher
+- Node.js 20 LTS, including npm
+- MySQL Server 8.0 or newer, unless application MySQL is on another server
+- MySQL command-line tools for backup and restore
+
+Open a new PowerShell window and verify:
 
     git --version
-    docker --version
-    docker compose version
+    py -3.12 --version
+    node --version
+    npm --version
+    mysql --version
 
-Your collector MySQL administrator must provide a separate account with **SELECT-only** access to the collector schema. RecipeControl must never use the collector's writable account.
+If PowerShell blocks local scripts, an administrator can allow locally created scripts for the current user:
+
+    Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+
+Do not use an unrestricted machine-wide execution policy.
 
 ### 2. Clone the repository
 
-Replace the placeholders with the actual repository URL and target directory:
+Choose a stable application directory. The service account must be able to read this directory and write its logs directory.
 
-    git clone <repository-url>
-    cd <repository-folder>
+    cd C:\
+    git clone <repository-url> RecipeControl
+    cd C:\RecipeControl
 
-If the repository is already on the VM:
+If the repository already exists:
 
-    cd <repository-folder>
+    cd C:\RecipeControl
     git branch --show-current
     git status --short
     git pull
 
-Do not pull over uncommitted VM-specific changes. Production secrets belong in the untracked environment file described next, not in source-controlled files.
+Do not pull over uncommitted production changes. Secrets belong only in the ignored .env file.
 
-### 3. Create the production environment file
+### 3. Create the RecipeControl application database
 
-    cp .env.production.example .env.production
-    nano .env.production
+RecipeControl must use a database separate from opcua_collector. Open MySQL as an administrator:
 
-Set at least these values:
+    mysql -u root -p
 
-- **APP_DB_PASSWORD**: a URL-safe password for RecipeControl's writable database user.
-- **APP_DB_ROOT_PASSWORD**: a different strong password for the application MySQL root user.
-- **SOURCE_DATABASE_URL**: the collector connection URL using its SELECT-only account.
-- **CORS_ORIGINS**: the protected browser origin, for example http://recipecontrol.internal.
+Run the following SQL after replacing the example password:
 
-Leave **ENABLE_LIVE_MODE=false**. Historical mode is the supported workflow.
+    CREATE DATABASE recipecontrol
+      CHARACTER SET utf8mb4
+      COLLATE utf8mb4_unicode_ci;
 
-Choose the source URL that matches where collector MySQL runs.
+    CREATE USER 'recipecontrol_app'@'127.0.0.1'
+      IDENTIFIED BY 'replace_with_a_strong_password';
 
-MySQL on the same Linux VM:
+    GRANT ALL PRIVILEGES ON recipecontrol.*
+      TO 'recipecontrol_app'@'127.0.0.1';
 
-    SOURCE_DATABASE_URL=mysql+pymysql://readonly_user:percent_encoded_password@host.docker.internal:3306/opcua_collector
+    FLUSH PRIVILEGES;
+    EXIT;
 
-MySQL on another network host:
+If MySQL runs on another host, the database administrator must create a narrowly scoped account for the Windows VM rather than using root. APP_DATABASE_URL will use that host instead of 127.0.0.1.
 
-    SOURCE_DATABASE_URL=mysql+pymysql://readonly_user:percent_encoded_password@10.20.30.40:3306/opcua_collector
+The application creates tables only after you explicitly run Alembic in step 7. Normal startup does not create the database.
 
-MySQL in another Docker network:
+### 4. Create or verify the read-only collector account
 
-    SOURCE_DATABASE_URL=mysql+pymysql://readonly_user:percent_encoded_password@collector-db:3306/opcua_collector
-    COLLECTOR_DOCKER_NETWORK=collector_default
+The collector administrator should create a separate SELECT-only account. A same-host example is:
 
-Important: 127.0.0.1 inside a container means that container, not the Linux VM. Use host.docker.internal for MySQL running directly on the VM. Percent-encode special password characters in database URLs. Never commit .env.production.
+    CREATE USER 'recipecontrol_reader'@'127.0.0.1'
+      IDENTIFIED BY 'replace_with_another_strong_password';
 
-For a collector in another Docker network, use both Compose files in every Compose command:
+    GRANT SELECT ON opcua_collector.*
+      TO 'recipecontrol_reader'@'127.0.0.1';
 
-    docker compose --env-file .env.production -f docker-compose.prod.yml -f docker-compose.collector-network.yml config --quiet
+    FLUSH PRIVILEGES;
 
-The remaining steps show the normal VM-host or network-host form. Add the second -f option to each command when using an external Docker network.
-
-### 4. Validate the deployment configuration
-
-This checks interpolation and Compose structure without starting anything:
-
-    docker compose --env-file .env.production -f docker-compose.prod.yml config --quiet
-
-Fix every reported missing variable before continuing.
-
-### 5. Build the production images
-
-    docker compose --env-file .env.production -f docker-compose.prod.yml build
-
-The frontend is built with npm run build and served by nginx. The Vite development server is not used in production.
-
-### 6. Start RecipeControl
-
-    docker compose --env-file .env.production -f docker-compose.prod.yml up -d
-
-On startup, Compose performs these operations in order:
-
-1. Start the private RecipeControl MySQL service.
-2. Run Alembic migrations against the RecipeControl application database.
-3. Start the FastAPI service and historical worker.
-4. Start nginx after the API is healthy.
-
-Only the frontend HTTP port is published. The API and application database remain internal. The collector database is read-only and is never migrated by RecipeControl. The live worker is not started.
-
-### 7. Confirm every service is healthy
-
-    docker compose --env-file .env.production -f docker-compose.prod.yml ps
-    curl --fail http://127.0.0.1/health
-    curl --fail http://127.0.0.1/api/health
-
-If a service is not healthy, inspect its logs:
-
-    docker compose --env-file .env.production -f docker-compose.prod.yml logs --tail=200 app-db migrate api worker frontend
-    docker compose --env-file .env.production -f docker-compose.prod.yml logs -f api worker
-
-### 8. Verify read-only collector access
-
-These diagnostics read collector metadata and samples but do not write collector data:
-
-    docker compose --env-file .env.production -f docker-compose.prod.yml run --rm api recipecontrol-source-smoke health
-    docker compose --env-file .env.production -f docker-compose.prod.yml run --rm api recipecontrol-source-smoke diagnostics
-
-Ask the database administrator to verify the collector account grants:
+Connect as that account and verify:
 
     SELECT CURRENT_USER();
     SHOW GRANTS FOR CURRENT_USER;
 
-The account should have SELECT only on the collector schema. It must not have INSERT, UPDATE, DELETE, CREATE, ALTER, or DROP privileges there.
+It must not have INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, or other write privileges on collector tables.
 
-### 9. Open the application and create the first analysis
+### 5. Install Python and frontend dependencies
 
-From a computer on the protected network, open:
+From an ordinary PowerShell window:
 
-    http://<vm-lan-address>/
+    cd C:\RecipeControl
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\Install-RecipeControl.ps1
 
-Then:
+The script performs only local installation and build operations:
 
-1. Open **Rule Builder** and select the required machine.
-2. Create a rule set and draft version.
-3. Search for tags, add conditions and groups, then save the draft.
-4. Lock the version. Locked versions are immutable.
-5. Open **Timeline**, select the machine and locked version, and enter a UTC start and inclusive end minute.
-6. Select **Analyze**. The historical worker processes the queued job.
-7. When it is complete, inspect the primary and condition lanes.
-8. Select a segment to add a Good, Bad, or Unsure label, classification, and note.
+- creates .venv with Python 3.12
+- installs RecipeControl
+- runs npm ci
+- runs npm run build
+- creates local logs and backups directories
+- copies .env.windows.example to .env if .env does not exist
 
-If an analysis remains queued, confirm the worker is healthy and inspect the worker logs from step 7.
+It does not connect to MySQL, run migrations, query the collector, or start the application.
 
-### 10. Back up before updates
+### 6. Configure the environment
 
-The application database is stored in the persistent recipecontrol_app_db Docker volume. Back it up before every update:
+Open the generated file:
 
-    mkdir -p backups
-    chmod 700 backups
-    docker compose --env-file .env.production -f docker-compose.prod.yml exec -T app-db sh -c 'exec mysqldump -urecipecontrol -p"$MYSQL_PASSWORD" --single-transaction --routines --triggers recipecontrol' > "backups/recipecontrol-$(date -u +%Y%m%dT%H%M%SZ).sql"
-    chmod 600 backups/recipecontrol-*.sql
+    notepad .env
 
-The full restore procedure is in [Production VM deployment](docs/vm-deployment.md). Never restore this backup into the collector database.
+At minimum, set APP_DATABASE_URL, SOURCE_DATABASE_URL, and CORS_ORIGINS.
 
-### 11. Pull and deploy a later update
+Application MySQL on this Windows VM:
 
-After taking a backup:
+    APP_DATABASE_URL=mysql+pymysql://recipecontrol_app:url_encoded_password@127.0.0.1:3306/recipecontrol
 
-    cd <repository-folder>
+Collector MySQL on this Windows VM:
+
+    SOURCE_DATABASE_URL=mysql+pymysql://recipecontrol_reader:url_encoded_password@127.0.0.1:3306/opcua_collector
+
+Collector MySQL on another network host:
+
+    SOURCE_DATABASE_URL=mysql+pymysql://recipecontrol_reader:url_encoded_password@10.20.30.40:3306/opcua_collector
+
+On native Windows, 127.0.0.1 correctly means the Windows VM. Make sure remote MySQL and Windows Firewall rules allow only the necessary hosts.
+
+Percent-encode special password characters in database URLs. For example, @ becomes %40 and # becomes %23. Do not commit or email .env.
+
+Keep these production values:
+
+    SOURCE_ADAPTER=mysql
+    SERVE_FRONTEND=true
+    FRONTEND_DIST_PATH=frontend/dist
+    ENABLE_LIVE_MODE=false
+    VITE_API_URL=/api
+    VITE_ENABLE_LIVE_MODE=false
+
+If operators browse to http://recipecontrol-vm:8000, use:
+
+    CORS_ORIGINS=http://recipecontrol-vm:8000
+
+### 7. Run application-database migrations
+
+This command connects only to APP_DATABASE_URL and creates or upgrades RecipeControl-owned tables:
+
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\Invoke-Migrations.ps1
+
+It does not create, alter, or drop collector-owned tables.
+
+### 8. Synchronize the local machine catalog
+
+Run the source diagnostics first:
+
+    .\.venv\Scripts\python.exe -m recipecontrol.source_smoke health
+    .\.venv\Scripts\python.exe -m recipecontrol.source_smoke diagnostics
+
+These commands issue read-only source queries and do not print connection URLs or credentials.
+
+Synchronize enabled source machines into the RecipeControl application database:
+
+    .\.venv\Scripts\python.exe -m recipecontrol.seed
+
+This reads source machines and writes only the local RecipeControl machine catalog. The application also refreshes the catalog when the machine list is opened.
+
+### 9. Test the API manually
+
+Open PowerShell window 1:
+
+    cd C:\RecipeControl
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\Start-Api.ps1 -Console
+
+Open PowerShell window 2 and check health:
+
+    Invoke-RestMethod http://127.0.0.1:8000/health
+    Invoke-RestMethod http://127.0.0.1:8000/api/health
+
+Open http://127.0.0.1:8000/ on the VM. Press Ctrl+C in window 1 after the test.
+
+### 10. Test the historical worker manually
+
+Open PowerShell window 2:
+
+    cd C:\RecipeControl
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\Start-Worker.ps1 -Console
+
+Leave both API and worker windows open, then create a small historical analysis in the browser. It should move from QUEUED to COMPLETE. Press Ctrl+C in both windows after testing.
+
+### 11. Open the firewall only for the protected network
+
+Run PowerShell as an administrator and replace the example subnet:
+
+    New-NetFirewallRule -DisplayName "RecipeControl protected web access" -Direction Inbound -Protocol TCP -LocalPort 8000 -RemoteAddress 10.20.0.0/16 -Action Allow
+
+Do not create an Any/Internet inbound rule. Operators can then open:
+
+    http://<windows-vm-name-or-ip>:8000/
+
+### 12. Configure automatic startup with Task Scheduler
+
+Use a dedicated, non-administrator Windows service account that has read/execute access to C:\RecipeControl, write access to C:\RecipeControl\logs, network access to both MySQL servers, and Log on as a batch job permission.
+
+Create two tasks in Task Scheduler.
+
+For the API task:
+
+1. Select **Create Task**, not Create Basic Task.
+2. Name it **RecipeControl API**.
+3. Select **Run whether user is logged on or not**.
+4. Use the dedicated non-administrator account.
+5. Add an **At startup** trigger with a 30-second delay.
+6. Add a **Start a program** action with Program set to powershell.exe.
+7. Set Arguments to:
+
+       -NoProfile -ExecutionPolicy Bypass -File C:\RecipeControl\scripts\windows\Start-Api.ps1
+
+8. Set Start in to C:\RecipeControl.
+9. Enable restart every 1 minute after failure and allow at least 3 attempts.
+10. Set **If the task is already running** to **Do not start a new instance**.
+
+Create **RecipeControl Historical Worker** with the same settings, but use:
+
+    -NoProfile -ExecutionPolicy Bypass -File C:\RecipeControl\scripts\windows\Start-Worker.ps1
+
+Do not create a live-worker task.
+
+Start and inspect the tasks:
+
+    Start-ScheduledTask -TaskName "RecipeControl API"
+    Start-ScheduledTask -TaskName "RecipeControl Historical Worker"
+    Get-ScheduledTask -TaskName "RecipeControl*"
+    Get-ScheduledTaskInfo -TaskName "RecipeControl API"
+    Get-ScheduledTaskInfo -TaskName "RecipeControl Historical Worker"
+
+### 13. Check logs and health
+
+    Get-Content C:\RecipeControl\logs\api.log -Tail 100
+    Get-Content C:\RecipeControl\logs\worker.log -Tail 100
+    Get-Content C:\RecipeControl\logs\worker.log -Wait
+    Invoke-RestMethod http://127.0.0.1:8000/health
+    Invoke-RestMethod http://127.0.0.1:8000/api/health
+
+### 14. Create the first real historical analysis
+
+1. Open RecipeControl from the protected network.
+2. Open **Rule Builder** and select the machine.
+3. Create a rule set and draft version.
+4. Search for tags and add the required conditions and groups.
+5. Save the draft and lock it.
+6. Open **Timeline** and choose the same machine and locked version.
+7. Enter a UTC start minute and inclusive UTC end minute.
+8. Select **Analyze**.
+9. Wait for the historical worker to mark it COMPLETE.
+10. Inspect primary and condition lanes, then annotate a segment.
+
+The same source tag may be used in multiple conditions. Conditions remain distinct by their condition IDs.
+
+### 15. Back up the RecipeControl database
+
+This prompts for the application password and avoids placing it in command history:
+
+    cd C:\RecipeControl
+    $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    mysqldump.exe --host=127.0.0.1 --user=recipecontrol_app --password --single-transaction --routines --triggers --result-file="backups\recipecontrol-$Stamp.sql" recipecontrol
+
+Backups contain RecipeControl definitions, analyses, minute snapshots, and annotations. They do not contain collector tables.
+
+### 16. Restore the RecipeControl database
+
+Test restores on an isolated system first. Stop both tasks, verify the target is recipecontrol rather than opcua_collector, restore, migrate, and restart:
+
+    Stop-ScheduledTask -TaskName "RecipeControl API"
+    Stop-ScheduledTask -TaskName "RecipeControl Historical Worker"
+    cmd.exe /c "mysql.exe --host=127.0.0.1 --user=recipecontrol_app --password recipecontrol < backups\selected-backup.sql"
+    .\scripts\windows\Invoke-Migrations.ps1
+    Start-ScheduledTask -TaskName "RecipeControl API"
+    Start-ScheduledTask -TaskName "RecipeControl Historical Worker"
+    Invoke-RestMethod http://127.0.0.1:8000/api/health
+
+### 17. Pull and deploy updates safely
+
+Back up first, then:
+
+    cd C:\RecipeControl
+    Stop-ScheduledTask -TaskName "RecipeControl API"
+    Stop-ScheduledTask -TaskName "RecipeControl Historical Worker"
     git branch --show-current
     git status --short
     git pull
-    docker compose --env-file .env.production -f docker-compose.prod.yml config --quiet
-    docker compose --env-file .env.production -f docker-compose.prod.yml build
-    docker compose --env-file .env.production -f docker-compose.prod.yml up -d
-    docker compose --env-file .env.production -f docker-compose.prod.yml ps
-    curl --fail http://127.0.0.1/api/health
+    .\scripts\windows\Install-RecipeControl.ps1
+    .\scripts\windows\Invoke-Migrations.ps1
+    Start-ScheduledTask -TaskName "RecipeControl API"
+    Start-ScheduledTask -TaskName "RecipeControl Historical Worker"
+    Invoke-RestMethod http://127.0.0.1:8000/api/health
+    Get-Content .\logs\api.log -Tail 100
+    Get-Content .\logs\worker.log -Tail 100
 
-### 12. Restart or stop the application
+### 18. Safe restart and shutdown
 
-Safe restart:
+Restart:
 
-    docker compose --env-file .env.production -f docker-compose.prod.yml restart api worker frontend
+    Stop-ScheduledTask -TaskName "RecipeControl API"
+    Stop-ScheduledTask -TaskName "RecipeControl Historical Worker"
+    Start-ScheduledTask -TaskName "RecipeControl API"
+    Start-ScheduledTask -TaskName "RecipeControl Historical Worker"
 
-Stop containers while retaining the database volume:
+Stop:
 
-    docker compose --env-file .env.production -f docker-compose.prod.yml down
+    Stop-ScheduledTask -TaskName "RecipeControl API"
+    Stop-ScheduledTask -TaskName "RecipeControl Historical Worker"
 
-Start them again:
+Stopping RecipeControl does not stop MySQL and does not delete data.
 
-    docker compose --env-file .env.production -f docker-compose.prod.yml up -d
+## Local fixture development
 
-Do not use docker compose down -v unless you intentionally want to destroy the RecipeControl application database. For backup/restore, rollback, external-Docker-network, and detailed troubleshooting procedures, see [Production VM deployment](docs/vm-deployment.md).
+The deterministic fixture requires no collector connection:
 
-## Local development with deterministic fixture data
+    Copy-Item .env.example .env
+    py -3.12 -m venv .venv
+    .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+    cd frontend
+    npm ci
+    cd ..
+    .\.venv\Scripts\python.exe -m alembic upgrade head
+    .\.venv\Scripts\python.exe -m recipecontrol.seed
 
-Prerequisites: Python 3.12+, Node 20+, npm, and optional Docker Compose.
+Keep SOURCE_ADAPTER=fixture, SERVE_FRONTEND=false, and APP_DATABASE_URL=sqlite:///./recipecontrol.db.
 
-```bash
-cp .env.example .env
-make setup
-make migrate
-make seed
-```
+Run three PowerShell windows:
 
-Run these three processes in separate terminals:
+    .\.venv\Scripts\python.exe -m uvicorn recipecontrol.api:app --reload --host 127.0.0.1 --port 8000
 
-```bash
-make backend
-make worker
-make frontend
-```
+    .\.venv\Scripts\python.exe -m recipecontrol.worker
 
-Open `http://localhost:5173`. API documentation is at `http://localhost:8000/docs`; readiness details are at `http://localhost:8000/api/health`.
+    cd frontend
+    npm run dev
 
-The fixture source supports any UTC range. The timeline form includes the requested preset from `2026-06-11 19:50` through `2026-06-23 14:20` UTC. Historical analyses are queued; keep `make worker` running. Live mode is experimental and disabled by default.
+Open http://127.0.0.1:5173.
 
-Timeline includes inactive locally known machines so their saved analyses remain reviewable. If source synchronization is temporarily unavailable, Timeline shows a warning and continues from the application database. Inactive machines cannot create definitions, analyses, or live sessions.
+## Verification commands
 
-## Docker development
+    .\.venv\Scripts\ruff.exe format --check backend
+    .\.venv\Scripts\ruff.exe check backend
+    .\.venv\Scripts\mypy.exe backend\recipecontrol
+    .\.venv\Scripts\pytest.exe backend\tests
+    cd frontend
+    npm test
+    npm run lint
+    npm run typecheck
+    npm run build
 
-The Compose stack uses MySQL 8.4 for writable RecipeControl data and the fixture source by default. Replace the `APP_DB_PASSWORD` and `APP_DB_ROOT_PASSWORD` placeholders in the uncommitted `.env` first:
+Optional real MySQL tests require two isolated test databases supplied through TEST_COLLECTOR_MYSQL_URL and TEST_APP_MYSQL_URL. Never point them at production:
 
-```bash
-docker compose up --build
-```
-
-Compose refuses to start without those uncommitted passwords. To connect a real source, configure the exact collector URL described in `docs/source-schema.md`.
-
-For a production VM, use the nginx-based image and internal-only API/database stack in `docker-compose.prod.yml`. The complete first-deploy, backup/restore, health, update, rollback, host-MySQL, and external-Docker-network procedures are in [VM deployment](docs/vm-deployment.md). RecipeControl has no user authentication yet; keep production access behind a LAN, VPN, firewall, authenticated gateway, or SSH tunnel.
-
-## Live source configuration
-
-The default remains `SOURCE_ADAPTER=fixture`. To use the authoritative `opcua_collector` schema:
-
-1. Create a read-only MySQL account restricted to `SELECT`.
-2. Set `SOURCE_ADAPTER=mysql` and `SOURCE_DATABASE_URL` only in `.env` or the process environment.
-3. Keep `APP_DATABASE_URL` on a separate writable database/account. Startup rejects reuse of the source username on the same host and port.
-4. Run `make seed`, then inspect `/api/health` and paginated tag search.
-
-Verify the source account while connected as that account:
-
-```sql
-SHOW GRANTS FOR CURRENT_USER;
-```
-
-It should have `SELECT` only on the collector schema. MySQL 8.0 or newer is required for the supported application and integration-test schema.
-
-The adapter contains only the fixed `machines`, `tags`, and `tag_samples` reads documented below. Query values are bound, the session time zone is `+00:00`, and Alembic uses only `APP_DATABASE_URL`. Never point `APP_DATABASE_URL` at the collector database.
-
-Read-only source smoke commands:
-
-```bash
-.venv/bin/recipecontrol-source-smoke health
-.venv/bin/recipecontrol-source-smoke diagnostics
-.venv/bin/recipecontrol-source-smoke machines
-.venv/bin/recipecontrol-source-smoke tags --machine 1 --query temperature --limit 20
-.venv/bin/recipecontrol-source-smoke range --machine 1
-.venv/bin/recipecontrol-source-smoke dry-run --machine 1 --tag 10 --kind numeric --start 2026-06-23T14:15:00Z --inclusive-end 2026-06-23T14:20:00Z
-```
-
-The dry run reports `2026-06-23T14:21:00+00:00` as the exclusive query end and never opens the application database.
-
-## Commands
-
-```bash
-make setup          # create venv and install Python/Node dependencies
-make migrate        # alembic upgrade head
-make seed           # import machine metadata from selected source adapter
-make backend        # FastAPI development server
-make worker         # persisted historical worker
-make live-worker    # live shadow worker
-make frontend       # Vite development server
-make lint           # Ruff format/check and ESLint
-make typecheck      # mypy and TypeScript
-make test-backend   # Pytest unit/integration suite
-make test-frontend  # Vitest/Testing Library suite
-make test-mysql-up  # start isolated collector/application MySQL test services
-make test-mysql     # exact collector schema + application MySQL historical workflow
-make test-mysql-down # remove isolated MySQL test services and volumes
-make test-mysql-all # run the three MySQL steps with cleanup on exit
-make e2e            # Playwright critical workflow
-make e2e-visual     # capture 24 deterministic viewport screenshots under docs/screenshots/visual
-make e2e-real       # unmocked migrated API + worker + fixture + frontend workflow
-make build          # production frontend build
-make compose-prod-check # validate production Compose interpolation and structure
-make checks         # every check above plus Playwright
-make verify         # local checks, real-stack browser flow, and isolated MySQL tests
-```
-
-First-time Playwright setup:
-
-```bash
-cd frontend
-npx playwright install chromium
-```
-
-Run a single persisted job or live tick without a long-running process:
-
-```bash
-.venv/bin/recipecontrol-worker --once
-.venv/bin/recipecontrol-live-worker --once
-```
-
-Downgrade the application schema:
-
-```bash
-.venv/bin/alembic downgrade base
-```
-
-## Manual fixture acceptance path
-
-1. Open Rule Builder, choose Fixture Line 1, and create a definition.
-2. Add one or more groups. A representative rule is `(Temperature > 250 for 5 minutes AND Pressure < 40 for 2 minutes) OR (Alarm Code = 12 AND Motor Running = false)`.
-3. Save/lock it, then return to Timeline and select the same machine/version.
-4. Apply the June 11–23 preset and Analyze. Wait for the worker to mark it complete.
-5. Inspect the continuous primary lane, condition lanes, Data Gap pattern, and delta Insufficient History recovery when a delta condition is included.
-6. Click an exact point, verify the default 15-minute trend, add Speed temporarily, label the segment, create a classification, and save a multiline note.
-7. Reload the saved analysis and verify the label. Retire the classification and confirm the existing segment keeps its snapshot.
-8. Analyze the same range again and choose Open Existing or Create New.
-9. Toggle UTC/Central and verify daylight-aware `America/Chicago` presentation.
-10. Archive the definition and verify the saved analysis, exact-minute details, trends, classifications, notes, and labels remain available.
-
-The same source tag may be selected in multiple conditions. Each condition receives its own stable condition ID, so `Temperature > 250` and `Temperature increases by 5 over 10 minutes` remain distinct break reasons.
-
-## Live-mode status
-
-Historical analysis is the supported MVP. `ENABLE_LIVE_MODE=false` and `VITE_ENABLE_LIVE_MODE=false` are the defaults. The API refuses new live sessions and the frontend hides the live start control while disabled. Do not enable live labeling until the remaining boundary/annotation and late-arrival behavior in `docs/live-mode.md` is fully tested.
+    $env:TEST_COLLECTOR_MYSQL_URL = "mysql+pymysql://test_user:url_encoded_password@127.0.0.1:3306/opcua_collector_test"
+    $env:TEST_APP_MYSQL_URL = "mysql+pymysql://test_user:url_encoded_password@127.0.0.1:3306/recipecontrol_test"
+    .\.venv\Scripts\pytest.exe backend\tests\test_mysql_integration.py backend\tests\test_migrations.py backend\mysql_tests\test_app_mysql_workflow.py
 
 ## Troubleshooting
 
-- `no such table`: run `make migrate` with the same `APP_DATABASE_URL` used by the API and workers.
-- Analysis remains queued: start `make worker`; inspect the analysis job status and server logs.
-- A worker that stops heartbeating is reclaimed after `STALE_JOB_TIMEOUT_SECONDS`; jobs fail with a sanitized message after `HISTORICAL_JOB_MAX_ATTEMPTS`.
-- During atomic result persistence, the background heartbeat writer stops and the job uses `HISTORICAL_PERSISTENCE_LEASE_SECONDS` (default 900 seconds). This avoids SQLite writer contention while protecting valid MySQL persistence from stale-job reclaim.
-- Retired classifications disappear from future choices, but a segment already carrying one may preserve or clear it while its quality label or note is edited.
-- Live mode is unavailable: this is expected while `ENABLE_LIVE_MODE=false`; historical analysis remains fully available.
-- Source health fails: verify the read-only URL, network path, and exact mapping variables. Errors returned to the browser are intentionally redacted.
-- MySQL datetime appears naive: the adapter intentionally attaches UTC because `sampled_at_utc` is authoritative UTC.
-- Browser test cannot launch: run `npx playwright install chromium` in `frontend`.
-- Vite reports a large chunk: ECharts is the principal bundle cost; this is a performance advisory, not a failed build. Route-level lazy loading is the next optimization.
+- **Frontend build missing:** run Install-RecipeControl.ps1.
+- **No application tables:** run Invoke-Migrations.ps1 using the same .env as API and worker.
+- **Analysis remains queued:** start the historical worker and inspect logs\worker.log.
+- **Source unavailable:** verify the SELECT-only URL, MySQL listener, firewall, and account host grant.
+- **Access denied:** URL-encode the password and verify the application and source credentials were not swapped.
+- **Port 8000 already in use:** stop the conflict or consistently choose another API port and firewall rule.
+- **Inactive machine:** historical analyses remain viewable; new definitions and analyses require an enabled machine.
 
-See [architecture](docs/architecture.md), [segmentation](docs/segmentation-algorithm.md), [source mapping](docs/source-schema.md), [data model](docs/data-model.md), and [live mode](docs/live-mode.md).
+## Safety notes
+
+- Collector tables are read-only and are never migrated by RecipeControl.
+- Application and source URLs must use separate credentials and databases.
+- Database timestamps are UTC.
+- Selected end minutes are inclusive; engine and persistence intervals are half-open.
+- Locked versions and generated historical boundaries are immutable through public APIs.
+- ENABLE_LIVE_MODE=false is the supported default.
+- RecipeControl has no built-in authentication.
+
+See [Windows VM deployment](docs/windows-vm-deployment.md), [architecture](docs/architecture.md), [segmentation](docs/segmentation-algorithm.md), [source mapping](docs/source-schema.md), [data model](docs/data-model.md), and [live-mode limitations](docs/live-mode.md).
